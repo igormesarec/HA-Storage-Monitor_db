@@ -5,6 +5,7 @@ observations in its OWN SQLite; it never writes to a monitored database.
 """
 from __future__ import annotations
 from dataclasses import dataclass, asdict
+from contextlib import contextmanager
 import json
 import math
 from pathlib import Path
@@ -42,10 +43,20 @@ def utc_hour(ts: int | float) -> int:
     return int(ts) // HOUR * HOUR
 
 
+@contextmanager
 def _raw_connection(path: str | Path):
+    """Always close the monitor's own SQLite connection after the transaction.
+
+    A bare ``with sqlite3.connect(...)`` commits/rolls back but DOES NOT close
+    the connection. The hourly monitor must not leak file descriptors.
+    """
     db = sqlite3.connect(path, timeout=1.0)
-    db.execute("PRAGMA busy_timeout=1000")
-    return db
+    try:
+        db.execute("PRAGMA busy_timeout=1000")
+        with db:
+            yield db
+    finally:
+        db.close()
 
 
 class SnapshotDB:
@@ -99,6 +110,7 @@ class SnapshotDB:
                  size=excluded.size, status=excluded.status,
                  method=excluded.method, measured_at=excluded.measured_at,
                  allocated=excluded.allocated, detail=excluded.detail
+               WHERE NOT (snapshots.status='ok' AND excluded.status!='ok')
              """, [(s.hour,s.source,s.size,s.status,s.method,s.measured_at,s.allocated,s.detail[:150]) for s in rows])
 
     def latest(self):
