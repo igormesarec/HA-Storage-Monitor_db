@@ -13,7 +13,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers import entity_registry as er
 from .const import DOMAIN, DEFAULT_INFLUX_SLUG, ALARM_HOURS, GROWTH_SOURCES
-from .engine import Sample, SnapshotDB, evaluate, utc_hour, allow_notification, DAY, HOUR
+from .engine import Sample, SnapshotDB, evaluate, utc_hour, allow_notification, allowed_acknowledgement_sources, DAY, HOUR
 from .sources import collect_local
 from .supervisor import get_influx_usage
 from .writers import top_writers
@@ -299,7 +299,8 @@ async def ws_acknowledge(hass,connection,msg):
     if m is None:
         connection.send_error(msg["id"],"not_loaded","Monitor not installed")
         return
-    valid_sources={x["source"] for x in await hass.async_add_executor_job(m.db.latest)}|{"disk_low"}
+    observed_sources={x["source"] for x in await hass.async_add_executor_job(m.db.latest)}
+    valid_sources=allowed_acknowledgement_sources(observed_sources)
     if msg["source"] not in valid_sources:
         connection.send_error(msg["id"],"unknown_source","Unknown source")
         return
