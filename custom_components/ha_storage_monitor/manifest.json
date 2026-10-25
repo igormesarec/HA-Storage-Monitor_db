@@ -1,0 +1,10 @@
+{
+  "domain": "ha_storage_monitor",
+  "name": "Home Assistant Storage Monitor",
+  "version": "0.1.0-beta.2",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [],
+  "requirements": [],
+  "iot_class": "local_polling"
+}

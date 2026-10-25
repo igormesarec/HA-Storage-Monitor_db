@@ -1,0 +1,11 @@
+# Copy into a NEW dedicated Lovelace dashboard (YAML mode).
+# Add resource URL: /ha_storage_monitor/storage-monitor-card.js (JavaScript Module)
+# This card contains Overview, Growth & Alarms, Top Writers, Settings tabs.
+title: Storage Monitor
+views:
+  - title: Storage Monitor
+    path: storage-monitor
+    icon: mdi:database-eye
+    cards:
+      - type: custom:ha-storage-monitor-card
+        language: en

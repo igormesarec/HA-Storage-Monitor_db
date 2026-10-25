@@ -1,0 +1,14 @@
+# EXAMPLE ONLY, do NOT apply without explicit owner approval.
+# First verify the REAL existing entity ID and disable SQL automatic polling.
+# Never create a second SQL size sensor.
+alias: "Storage Monitor: refresh EXISTING Recorder SQL sensor hourly"
+description: "Update existing read-only page_count x page_size SQL query hourly"
+triggers:
+  - trigger: time_pattern
+    minutes: "0"
+conditions: []
+actions:
+  - action: homeassistant.update_entity
+    target:
+      entity_id: sensor.ha_recorder_database_size  # VERIFY before enabling
+mode: single
