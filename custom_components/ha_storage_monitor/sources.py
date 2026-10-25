@@ -56,9 +56,16 @@ def collect_local(config_dir: str, hour: int, now: int) -> list[Sample]:
     # Exclude Recorder and our own snapshot database to avoid double-counting
     # or producing a feedback loop by monitoring the monitor's history.
     discovered = []
+    scan_incomplete = False
     allowed_suffixes = {".db", ".sqlite", ".sqlite3"}
     for folder in (config, config / ".storage"):
-        if not folder.is_dir() or folder.is_symlink():
+        if folder.is_symlink():
+            scan_incomplete = True
+            continue
+        if not folder.is_dir():
+            # The optional .storage folder may not exist on a new HA instance.
+            if folder == config:
+                scan_incomplete = True
             continue
         try:
             # Bounded set of file names; no recursion, file content reads,
@@ -66,7 +73,11 @@ def collect_local(config_dir: str, hour: int, now: int) -> list[Sample]:
             candidates = sorted(p for p in folder.iterdir()
                                 if p.suffix.lower() in allowed_suffixes)
         except OSError:
+            scan_incomplete = True
             continue
+        if len(candidates) > 64:
+            # A truncated total is not an exact measurement.
+            scan_incomplete = True
         for path in candidates[:64]:
             if path.name == "home-assistant_v2.db" and folder == config:
                 continue
@@ -91,7 +102,7 @@ def collect_local(config_dir: str, hour: int, now: int) -> list[Sample]:
                                          "sqlite_main_wal_shm_file_stat", None,
                                          detail="Local database file or sidecar unreadable"))
     items.extend(discovered)
-    if discovered and all(s.status == "ok" for s in discovered):
+    if not scan_incomplete and all(s.status == "ok" for s in discovered):
         items.append(Sample(hour, "database_total", sum(s.size for s in discovered),
                             "ok", "sum_discovered_local_sqlite_files", now,
                             sum(s.allocated for s in discovered)
@@ -99,5 +110,5 @@ def collect_local(config_dir: str, hour: int, now: int) -> list[Sample]:
     else:
         items.append(Sample(hour, "database_total", None, "unavailable",
                             "sum_discovered_local_sqlite_files", None,
-                            detail="No additional accessible SQLite files or one is unreadable"))
+                            detail="Directory listing incomplete, >64 candidates, or a database is unreadable"))
     return items

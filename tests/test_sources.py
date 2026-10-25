@@ -93,3 +93,31 @@ def test_protects_from_symlinked_database(tmp_path):
     samples = {s.source:s for s in collect_local(str(tmp_path),3600,3610)}
     assert samples["database:link.db"].status == "unavailable"
     assert samples["database_total"].status == "unavailable"
+
+
+def test_generic_sqlite_total_zero_when_directories_scanned_and_empty(tmp_path):
+    (tmp_path/'home-assistant_v2.db').write_bytes(b'recorder')
+    (tmp_path/'.storage').mkdir()
+    data={s.source:s for s in collect_local(str(tmp_path),3600,3610)}
+    assert data['database_total'].status=='ok'
+    assert data['database_total'].size==0
+
+
+def test_generic_sqlite_total_never_reports_truncated_scan_as_exact(tmp_path):
+    (tmp_path/'home-assistant_v2.db').write_bytes(b'recorder')
+    for i in range(65):
+        (tmp_path/f'other{i:03}.db').write_bytes(b'x')
+    data={s.source:s for s in collect_local(str(tmp_path),3600,3610)}
+    assert data['database_total'].status=='unavailable'
+    assert data['database_total'].size is None
+    assert sum(s.source.startswith('database:') for s in data.values())<=64
+
+
+def test_generic_sqlite_directory_symlink_not_traversed(tmp_path):
+    (tmp_path/'home-assistant_v2.db').write_bytes(b'recorder')
+    other=tmp_path/'external';other.mkdir()
+    (other/'data.db').write_bytes(b'abc')
+    (tmp_path/'.storage').symlink_to(other,target_is_directory=True)
+    data={s.source:s for s in collect_local(str(tmp_path),3600,3610)}
+    assert data['database_total'].status=='unavailable'
+    assert 'database:.storage/data.db' not in data

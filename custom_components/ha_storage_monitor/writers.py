@@ -1,6 +1,7 @@
 """Bounded, read-only diagnosis of entities creating Recorder state rows."""
 from __future__ import annotations
 from pathlib import Path
+from contextlib import closing
 import sqlite3
 import time
 from urllib.parse import quote
@@ -19,7 +20,7 @@ def top_writers(recorder_file: str, now: int, *, budget_seconds: float = 4.0) ->
         return {"status":"unavailable","reason":"Recorder SQLite file absent","entities":[]}
     dburi = "file:" + quote(str(target), safe="/") + "?mode=ro"
     try:
-        with sqlite3.connect(dburi,uri=True,timeout=1) as db:
+        with closing(sqlite3.connect(dburi,uri=True,timeout=1)) as db:
             db.execute("PRAGMA query_only=ON")
             db.execute("PRAGMA busy_timeout=1000")
             indices = {r[1] for r in db.execute("PRAGMA index_list('states')")}

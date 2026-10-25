@@ -74,8 +74,10 @@ class HAStorageMonitorCard extends HTMLElement {
     const sel = this.shadowRoot.querySelector('#source');
     if(sel) sel.onchange=e=>{this.selected=e.target.value;this.loadHistory();};
     this.shadowRoot.querySelectorAll('[data-ack]').forEach(el => el.onclick=async()=>{
-      if(!window.confirm(this.t('Mute this source for 24 hours?','Utišam ta vir za 24 ur?')))return;
-      await this._hass.callWS({type:'ha_storage_monitor/acknowledge',source:el.dataset.ack,hours:24});
+      const hours = Number(el.dataset.hours || 24);
+      if(!window.confirm(this.t(`Mute this alert for ${hours===168?'7 days':'24 hours'}?`,
+        `Utišam to opozorilo za ${hours===168?'7 dni':'24 ur'}?`)))return;
+      await this._hass.callWS({type:'ha_storage_monitor/acknowledge',source:el.dataset.ack,hours});
       await this.reload();
     });
     const refresh=this.shadowRoot.querySelector('#refresh');if(refresh)refresh.onclick=()=>this.reload();
@@ -95,8 +97,10 @@ class HAStorageMonitorCard extends HTMLElement {
     const cards=order.filter(k=>s[k]).map(k=>{
       const r=s[k], stale = !r.measured_at || this.data.now-r.measured_at > (k==='influx_addon'?7:2)*3600;
       const delta = this.data.changes?.[k] || {};
-      const staleAlarm = this.data.alerts?.['stale:'+k]?.active;
-      return `<article class="box"><div>${this.esc(this.label(k))}</div><div class="big">${this.size(r.size)}</div><div class="muted">6h ${this.signed(delta.delta6h)} · 24h ${this.signed(delta.delta24h)}<br>${staleAlarm?'<b class="alert">MISSING MEASUREMENTS · </b>':''}${this.esc(r.status)}${stale?' · STALE':''} · ${this.esc(r.method)}<br>${this.when(r.measured_at)}</div></article>`;
+      const staleState = this.data.alerts?.['stale:'+k];
+      const staleAlarm = staleState?.active;
+      const muteButtons = staleAlarm ? `<div class="row"><button data-ack="${this.esc('stale:'+k)}" data-hours="24">${this.t('Mute 24h','Utišaj 24h')}</button><button data-ack="${this.esc('stale:'+k)}" data-hours="168">${this.t('Mute 7d','Utišaj 7d')}</button></div>${staleState.acknowledged_until>this.data.now?`<span class="muted">${this.t('Muted until','Utišano do')} ${this.when(staleState.acknowledged_until)}</span>`:''}` : '';
+      return `<article class="box"><div>${this.esc(this.label(k))}</div><div class="big">${this.size(r.size)}</div><div class="muted">6h ${this.signed(delta.delta6h)} · 24h ${this.signed(delta.delta24h)}<br>${staleAlarm?'<b class="alert">MISSING MEASUREMENTS · </b>':''}${this.esc(r.status)}${stale?' · STALE':''} · ${this.esc(r.method)}<br>${this.when(r.measured_at)}</div>${muteButtons}</article>`;
     }).join('');
     const available=s.disk_total?.size && s.disk_free?.size!=null ? ((100*s.disk_free.size/s.disk_total.size).toFixed(1)+'%'):'n/a';
     return `<div class="help">${this.t('One SQLite database supplies Recorder, History, Logbook and statistics. These are NOT separate file sizes. The original SQL sensor is preserved.','Recorder, Zgodovina, Dnevnik in statistika so v eni podatkovni bazi. Obstoječi SQL senzor ostaja nespremenjen.')}</div>
@@ -133,10 +137,13 @@ class HAStorageMonitorCard extends HTMLElement {
       return `<tr><td>${this.esc(this.label(k))}</td><td class="${g.status==='alarm'?'alert':''}">${this.esc(g.status)}</td><td>${this.signed(g.delta24)}</td><td>${g.baseline_daily==null?'n/a':this.signed(g.baseline_daily)}</td><td>${g.excess_ratio==null?'n/a':(g.excess_ratio*100).toFixed(1)+'%'}</td><td>${a?.active?`<button data-ack="${this.esc(k)}">${this.t('Mute 24h','Utišaj 24h')}</button>`:' '}</td></tr>`;
     }).join('');
     const disk=this.data.alerts.disk_low?.active ? `<p class="alert">${this.t('CRITICAL: disk low','KRITIČNO: zmanjkuje prostora')}</p>`:'';
+    const missing = Object.entries(this.data.alerts||{}).filter(([k,a])=>k.startsWith('stale:')&&a?.active);
+    const missingControls=missing.length ? `<h4>${this.t('Missing measurements','Manjkajoče meritve')}</h4>`+missing.map(([k,a])=>
+      `<div class="row"><strong class="alert">${this.esc(this.label(k.slice(6)))}</strong><button data-ack="${this.esc(k)}" data-hours="24">${this.t('Mute 24h','Utišaj 24h')}</button><button data-ack="${this.esc(k)}" data-hours="168">${this.t('Mute 7d','Utišaj 7d')}</button>${a.acknowledged_until>this.data.now?this.t('Muted until','Utišano do')+' '+this.when(a.acknowledged_until):''}</div>`).join('') : '';
     const prediction=keys.map(k=>{const g=this.data.growth[k],current=s[k];if(!g || !current || g.baseline_daily==null || g.baseline_daily<=0 || current.size==null) return '';
        return `<tr><td>${this.esc(this.label(k))}</td><td>${this.size(current.size+7*g.baseline_daily)}</td><td>${this.size(current.size+30*g.baseline_daily)}</td></tr>`;
     }).filter(Boolean).join('');
-    return `<div class="help">${this.t('Alarm checks at 00:00, 06:00, 12:00, 18:00 Europe/Ljubljana. Last 24h positive growth must be STRICTLY greater than 1.05 × the previous seven days average daily growth. First 8 days are learning. Database decreases reset the baseline.','Preverjanje ob 00, 06, 12, 18. Rast zadnjih 24 ur mora biti STROGO večja od 1,05-kratnika povprečne dnevne rasti predhodnih sedmih dni. Prvih 8 dni je učenje.')}</div>${disk}
+    return `<div class="help">${this.t('Alarm checks at 00:00, 06:00, 12:00, 18:00 Europe/Ljubljana. Last 24h positive growth must be STRICTLY greater than 1.05 × the previous seven days average daily growth. First 8 days are learning. Database decreases reset the baseline.','Preverjanje ob 00, 06, 12, 18. Rast zadnjih 24 ur mora biti STROGO večja od 1,05-kratnika povprečne dnevne rasti predhodnih sedmih dni. Prvih 8 dni je učenje.')}</div>${disk}${missingControls}
       <div class="table-scroll"><table class="table"><thead><tr><th>${this.t('Source','Vir')}</th><th>${this.t('Status','Stanje')}</th><th>24h</th><th>${this.t('Previous 7d/day','Prejšnjih 7d/dan')}</th><th>${this.t('Deviation','Odstopanje')}</th><th></th></tr></thead><tbody>${scores}</tbody></table></div>
       <h4>${this.t('Simple continuation forecast (observed baseline, not a guaranteed forecast)','Enostavna projekcija glede na izmerjeno rast')}</h4>
       <div class="table-scroll"><table class="table"><thead><tr><th>${this.t('Source','Vir')}</th><th>+7d</th><th>+30d</th></tr></thead><tbody>${prediction}</tbody></table></div>
