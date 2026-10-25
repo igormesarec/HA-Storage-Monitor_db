@@ -97,3 +97,40 @@ def test_snapshot_history_survives_restart_and_retention_only_own(tmp_path):
     assert len(db2.history('disk_free',T-DAY))==2
     db2.compact_retention(T)
     assert len(db2.history('disk_free',T-DAY))==1
+
+
+def test_verified_sample_is_not_downgraded_by_cached_restart(tmp_path):
+    db=SnapshotDB(tmp_path/'monitor.sqlite3');db.initialize()
+    db.save([Sample(T,'influx_addon',100,'ok','supervisor',T)])
+    db.save([Sample(T,'influx_addon',100,'cached','supervisor',T-HOUR)])
+    row=db.latest()[0]
+    assert row['size']==100 and row['status']=='ok' and row['measured_at']==T
+    db.save([Sample(T,'influx_addon',None,'unavailable','supervisor',None)])
+    assert db.latest()[0]['status']=='ok'
+    # A new verified measurement in the same hour is allowed to replace the old one.
+    db.save([Sample(T,'influx_addon',105,'ok','supervisor',T+100)])
+    assert db.latest()[0]['size']==105
+
+
+def test_own_database_connection_is_closed_after_read(tmp_path, monkeypatch):
+    from ha_storage_monitor import engine
+    real_connect=engine.sqlite3.connect
+    calls=[]
+    class ConnectionProxy:
+        def __init__(self, conn): self.conn=conn
+        def __enter__(self): self.conn.__enter__(); return self
+        def __exit__(self,*args): return self.conn.__exit__(*args)
+        def __getattr__(self,name): return getattr(self.conn,name)
+        def close(self): calls.append('closed');self.conn.close()
+    def tracked(*args,**kwargs): return ConnectionProxy(real_connect(*args,**kwargs))
+    monkeypatch.setattr(engine.sqlite3,'connect',tracked)
+    db=SnapshotDB(tmp_path/'own.sqlite3')
+    db.initialize();db.latest();db.get_alert('a')
+    assert len(calls)==3
+
+
+def test_downgraded_hour_does_not_poison_eight_day_baseline(tmp_path):
+    db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()
+    db.save([Sample(r['hour'],'recorder_total',r['size'],'ok','stat',r['hour']) for r in history()])
+    db.save([Sample(T,'recorder_total',None,'unavailable','stat',None)])
+    assert evaluate('recorder_total',db.history('recorder_total',T-8*DAY),T).status=='alarm'
