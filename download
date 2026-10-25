@@ -1,0 +1,25 @@
+# Python / local test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+# Live Home Assistant data and secrets: NEVER commit
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.tar
+*.tar.gz
+*.backup
+*.bak
+secrets.yaml
+known_devices.yaml
+.storage/
+/config/
+*.log
