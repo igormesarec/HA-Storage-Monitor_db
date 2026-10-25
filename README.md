@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.1.0-beta.2` (25 October 2026)
+**Independent prototype:** `0.1.1-beta.1` (25 October 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -79,6 +79,16 @@ API documentation:
 - No live measured query benchmark against the 5.11 GiB Recorder database yet. Query self-cancels at four seconds; a timed-out query returns unavailable.
 - Admin-only WebSocket command and panel integration still require a live Home Assistant API compatibility check; not certified ready for unattended production deployment.
 - Notification transport is HA persistent_notification, optional phone/mobile destinations and incident timeline UI are future work.
+
+## v0.1.1-beta.1 safety and repository update
+
+- The monitoring SQLite store now **closes every connection** after each operation, preventing file descriptor accumulation during hourly sampling and frequent dashboard reads.
+- Generic SQLite totals now show verified **0 bytes** only when both authorized directories were scanned successfully and no additional databases exist. More than 64 candidates, an inaccessible directory, or a symlinked directory produces an **unavailable/incomplete total**, not a misleading partial sum.
+- A later cached/unavailable observation in the **same UTC hour** cannot overwrite an already verified `ok` observation. This protects eight-day baseline quality after a restart or duplicate callback.
+- Recorder writer diagnostic SQLite connections are explicitly closed. They remain `mode=ro`, query-only, time-index guarded, and capped by a four-second progress handler.
+- GitHub Actions workflow belongs at `.github/workflows/tests.yml` and is deliberately **not** at repository root. Workflow execution on GitHub must be verified separately.
+- GitHub/HACS icon assets in the repository root are source assets, **not proof that the HACS catalog or Home Assistant brand registry has accepted branding**. Publication to the relevant branding repository may be required.
+- This is still an offline-reviewed prototype. No live HA OS permission test, install, or restart has been performed.
 
 ## Local development tests
 
