@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from ha_storage_monitor.engine import Sample, SnapshotDB, evaluate, allow_notification, HOUR, DAY, utc_hour
+from ha_storage_monitor.engine import Sample, SnapshotDB, evaluate, allow_notification, allowed_acknowledgement_sources, HOUR, DAY, utc_hour
 
 MiB=1024**2
 T=10_000*HOUR
@@ -134,3 +134,43 @@ def test_downgraded_hour_does_not_poison_eight_day_baseline(tmp_path):
     db.save([Sample(r['hour'],'recorder_total',r['size'],'ok','stat',r['hour']) for r in history()])
     db.save([Sample(T,'recorder_total',None,'unavailable','stat',None)])
     assert evaluate('recorder_total',db.history('recorder_total',T-8*DAY),T).status=='alarm'
+
+
+def test_midday_purge_and_regrowth_is_maintenance_even_when_daily_net_positive():
+    points=history()
+    # At 10:00 the file is smaller than at 09:00; by 11:00 it has
+    # recovered. The eight daily boundaries all still show growth.
+    day=T-2*DAY
+    original={p["hour"]:p["size"] for p in points}
+    for p in points:
+        if p["hour"]==day+10*HOUR:
+            p["size"]-=500*MiB
+    assert points[-1]["size"]>points[-25]["size"]
+    assert evaluate('recorder_total',points,T).status=='maintenance'
+
+def test_influx_six_hour_observed_shrink_marks_maintenance():
+    points=history(cadence=6)
+    points[11]["size"]-=1000*MiB
+    assert evaluate('influx_addon',points,T,cadence_hours=6).status=='maintenance'
+
+def test_purge_older_than_eight_days_does_not_reset_current_baseline():
+    points=history()
+    points.insert(0,dict(hour=T-8*DAY-HOUR,size=5000*MiB,status='ok',measured_at=T-8*DAY-HOUR))
+    assert evaluate('recorder_total',points,T).status=='alarm'
+
+def test_unverified_shrink_does_not_claim_observed_maintenance():
+    points=history()
+    points[30]['size']-=1000*MiB
+    points[30]['status']='cached'
+    assert evaluate('recorder_total',points,T).status=='alarm'
+
+def test_acknowledgment_keys_include_stale_for_observed_sources_only(tmp_path):
+    allowed=allowed_acknowledgement_sources(['recorder_total','influx_addon'])
+    assert {'disk_low','recorder_total','influx_addon',
+            'stale:recorder_total','stale:influx_addon'}==allowed
+    assert 'stale:unobserved' not in allowed
+    db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()
+    db.acknowledge('stale:influx_addon',T+24*HOUR)
+    state=db.get_alert('stale:influx_addon')
+    assert not allow_notification(state,'2026-10-25:06',T+HOUR)
+    assert allow_notification(state,'2026-10-26:06',T+25*HOUR)
