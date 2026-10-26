@@ -1,6 +1,7 @@
 """Independent Storage Monitor: local hourly metadata, never changes production DBs."""
 from __future__ import annotations
 from datetime import datetime
+from functools import partial
 import logging
 from pathlib import Path
 import time
@@ -12,11 +13,11 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers import entity_registry as er
-from .const import DOMAIN, DEFAULT_INFLUX_SLUG, ALARM_HOURS, GROWTH_SOURCES
+from .const import DOMAIN, DEFAULT_INFLUX_SLUG, ALARM_HOURS, GROWTH_SOURCES, resolved_options
 from .engine import Sample, SnapshotDB, evaluate, utc_hour, allow_notification, allowed_acknowledgement_sources, disk_low_evidence, DAY, HOUR
 from .sources import collect_local
 from .supervisor import get_influx_usage
-from .writers import collect_writer_window, local_checkpoint_window, summarize_writer_windows
+from .writers import collect_writer_checkpoint, disabled_writer_summary, local_checkpoint_window, summarize_writer_windows
 
 _LOGGER = logging.getLogger(__name__)
 TZ = ZoneInfo("Europe/Ljubljana")
@@ -43,10 +44,17 @@ class StorageMonitor:
         self.cache_influx: Sample | None=None
         self.last_influx_probe: int | None=None
         self._last_disk_low=False
-        self.options={**entry.data,**entry.options}
+        self.options=resolved_options(entry.data,entry.options)
+        self.writer_diagnostics_enabled=False
+        self.writer_diagnostics_enabled_at: int | None=None
 
     async def start(self):
         await self.hass.async_add_executor_job(self.db.initialize)
+        self.writer_diagnostics_enabled=bool(
+            self.options["enable_recorder_writer_diagnostics"])
+        self.writer_diagnostics_enabled_at=await self.hass.async_add_executor_job(
+            self.db.configure_writer_diagnostics,
+            self.writer_diagnostics_enabled,int(time.time()))
         self.unsub = async_track_time_change(self.hass,self._hourly,minute=0,second=10)
         # Cold start updates current measurements without firing historical growth alerts.
         self.entry.async_create_background_task(
@@ -110,16 +118,21 @@ class StorageMonitor:
                            detail="Previously monitored database missing") if s.source=="database_total" else s for s in samples]
             await self.hass.async_add_executor_job(self.db.save,samples)
             if check:
-                # Four bounded LOCAL checkpoint windows per day. Each queries
-                # only the interval since the preceding checkpoint, never
-                # eight days of Recorder. Durable idempotence across restarts.
-                start_ts, end_ts = local_checkpoint_window(local_now)
-                already = await self.hass.async_add_executor_job(self.db.writer_window_exists, end_ts)
-                if not already:
-                    diagnostic = await self.hass.async_add_executor_job(
-                        collect_writer_window, self.hass.config.path("home-assistant_v2.db"),
-                        start_ts, end_ts)
-                    await self.hass.async_add_executor_job(self.db.save_writer_window, diagnostic)
+                if self.writer_diagnostics_enabled:
+                    # Four bounded LOCAL checkpoint windows per day. Never
+                    # query an interval that began before explicit opt-in.
+                    start_ts, end_ts = local_checkpoint_window(local_now)
+                    already = await self.hass.async_add_executor_job(
+                        self.db.writer_window_exists,end_ts)
+                    diagnostic = await self.hass.async_add_executor_job(partial(
+                        collect_writer_checkpoint,
+                        self.hass.config.path("home-assistant_v2.db"),
+                        start_ts,end_ts,enabled=True,
+                        enabled_at=self.writer_diagnostics_enabled_at,
+                        already_exists=already))
+                    if diagnostic is not None:
+                        await self.hass.async_add_executor_job(
+                            self.db.save_writer_window,diagnostic)
                 await self.check_growth(hour,local_now)
             await self.check_disk(samples,hour,local_now)
             await self.check_stale(samples,hour,local_now)
@@ -254,10 +267,15 @@ class StorageMonitor:
                 older=samples_by_hour.get(now-delta*HOUR)
                 changes[key]["delta"+str(delta)+"h"] = (
                     current["size"]-older["size"] if current and older else None)
-        # Summarize at most 32 locally saved six-hour intervals, NOT Recorder.
-        window_rows = await self.hass.async_add_executor_job(
-            self.db.writer_window_history,checkpoint_end-9*DAY,checkpoint_end)
-        writers = summarize_writer_windows(window_rows,checkpoint_end)
+        # Disabled means no Recorder access and no historical results presented
+        # as current. Enabled dashboards read only the monitor's own summaries.
+        if self.writer_diagnostics_enabled:
+            window_rows = await self.hass.async_add_executor_job(
+                self.db.writer_window_history,checkpoint_end-9*DAY,checkpoint_end)
+            writers = summarize_writer_windows(window_rows,checkpoint_end)
+            writers["enabled_at"] = self.writer_diagnostics_enabled_at
+        else:
+            writers = disabled_writer_summary()
         registry = er.async_get(self.hass)
         grouped = {}
         for item in writers.get("entities",[]):
@@ -275,8 +293,9 @@ class StorageMonitor:
             grouped.values(),key=lambda r:-(r["rows_24h"] if r["rows_24h"] is not None else r["rows_6h"]))
         return {"samples":items,"alerts":alerts,"growth":growth,"writers":writers,
                 "now":int(time.time()),"timezone":"Europe/Ljubljana","changes":changes,
+                "writer_diagnostics_enabled":self.writer_diagnostics_enabled,
                 "baseline":"24h size change compared with average DAILY growth of preceding seven days; strictly >5%",
-                "scope":"Filesystem file stat reports apparent bytes, disk statvfs is /config mount, Supervisor is add-on total"}
+                "scope":"Filesystem file stat reports apparent bytes, disk usage is scoped to /config path, Supervisor is add-on total"}
 
 async def async_setup_entry(hass,entry):
     monitor=StorageMonitor(hass,entry)

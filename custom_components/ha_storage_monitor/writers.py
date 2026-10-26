@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import sqlite3
-import time
+from time import monotonic
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -76,10 +76,10 @@ def collect_writer_window(recorder_file: str, start: int, end: int, *,
             indexes = {r[1] for r in db.execute("PRAGMA index_list('states')")}
             if INDEX not in indexes:
                 return _failed(start, end, "Required time index missing; scan refused")
-            deadline = time.monotonic() + budget_seconds
-            db.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
+            deadline = monotonic() + budget_seconds
+            db.set_progress_handler(lambda: 1 if monotonic() >= deadline else 0, 1000)
             try:
-                if time.monotonic() >= deadline:
+                if monotonic() >= deadline:
                     return _failed(start, end, "Recorder read time budget exceeded")
                 # Index-bounded streaming query. No GROUP BY, ORDER BY, or
                 # SQLite temporary B-tree; Python counters have explicit caps.
@@ -97,13 +97,13 @@ def collect_writer_window(recorder_file: str, start: int, end: int, *,
                         return _failed(start, end, "Recorder row safety cap reached; no partial ranking")
                     # The SQLite progress handler checks the deadline during
                     # execution. Check it here as well between cursor steps.
-                    if total_rows % 256 == 0 and time.monotonic() >= deadline:
+                    if total_rows % 256 == 0 and monotonic() >= deadline:
                         return _failed(start, end, "Recorder read time budget exceeded")
                     name = str(entity_id)
                     if name not in counts and len(counts) >= max_entities:
                         return _failed(start, end, "Entity count safety cap reached; no partial ranking")
                     counts[name] = counts.get(name, 0) + 1
-                if time.monotonic() >= deadline:
+                if monotonic() >= deadline:
                     return _failed(start, end, "Recorder read time budget exceeded")
                 payload = json.dumps(counts, separators=(",", ":"))
                 if len(payload.encode("utf-8")) > max_json_bytes:
@@ -114,6 +114,39 @@ def collect_writer_window(recorder_file: str, start: int, end: int, *,
                 db.set_progress_handler(None, 0)
     except (sqlite3.Error, OSError) as err:
         return _failed(start, end, f"Read-only query failed or timed out: {type(err).__name__}")
+
+
+def collect_writer_checkpoint(recorder_file: str, start: int, end: int, *,
+                              enabled: bool, enabled_at: int | None,
+                              already_exists: bool = False,
+                              collector=collect_writer_window) -> dict | None:
+    """Gate the Recorder collector and refuse retroactive interval reads."""
+    if not enabled or already_exists:
+        return None
+    if enabled_at is None or enabled_at > start:
+        return _failed(start, end,
+                       "Diagnostics enabled after interval start; retroactive query refused")
+    return collector(recorder_file, start, end)
+
+
+def disabled_writer_summary() -> dict:
+    """Represent opt-out explicitly; never imply a verified zero-row result."""
+    return {
+        "status": "disabled",
+        "reason": "Recorder writer diagnostics disabled",
+        "entities": [],
+        "intervals_verified": None,
+        "intervals_required": 32,
+        "intervals_missing": None,
+        "intervals_failed": None,
+        "intervals_mismatched": None,
+        "last24_complete": False,
+        "previous7_complete": False,
+        "last24_elapsed_hours": None,
+        "ranking_period": "disabled",
+        "all_recorder_rows_24h": None,
+        "caveat": "Recorder was not opened or queried for writer diagnostics.",
+    }
 
 
 def summarize_writer_windows(rows: list[dict], end_ts: int) -> dict:

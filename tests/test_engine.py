@@ -183,3 +183,14 @@ def test_disk_low_alarm_is_independent_of_growth_learning():
     low,threshold=disk_low_evidence(7*gib,8*gib,5*gib)
     assert low is True and threshold==8*gib
     assert disk_low_evidence(None,8*gib,15*gib)[0] is None
+
+
+def test_writer_diagnostics_state_survives_reload_and_resets_after_disable(tmp_path):
+    db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()
+    assert db.configure_writer_diagnostics(False,100) is None
+    assert db.configure_writer_diagnostics(True,200)==200
+    # A normal config-entry reload while still enabled keeps the consent time.
+    assert db.configure_writer_diagnostics(True,300)==200
+    assert db.configure_writer_diagnostics(False,400) is None
+    # Re-enabling after an explicit disable starts a new non-retroactive run.
+    assert db.configure_writer_diagnostics(True,500)==500

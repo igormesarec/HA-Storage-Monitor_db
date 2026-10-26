@@ -5,7 +5,8 @@ from zoneinfo import ZoneInfo
 
 from ha_storage_monitor.engine import SnapshotDB, DAY, HOUR
 from ha_storage_monitor.writers import (
-    collect_writer_window, local_checkpoint_window, summarize_writer_windows,
+    collect_writer_checkpoint, collect_writer_window, disabled_writer_summary,
+    local_checkpoint_window, summarize_writer_windows,
 )
 
 TZ = ZoneInfo("Europe/Ljubljana")
@@ -180,11 +181,11 @@ def test_payload_cap_does_not_publish_partial_counts(tmp_path):
     assert result['counts']=={}
 
 
-def test_tiny_time_budget_interrupts_expensive_query(tmp_path):
+def test_time_budget_interrupts_query_deterministically(tmp_path,monkeypatch):
     p=tmp_path/'recorder.db';create_test_recorder(p)
-    with sqlite3.connect(p) as db:
-        db.executemany('INSERT INTO states VALUES(1,?)',((3600+i/100,) for i in range(20000)))
-    result=collect_writer_window(str(p),3600,7200,budget_seconds=1e-9)
+    readings=iter((100.0,101.0))
+    monkeypatch.setattr('ha_storage_monitor.writers.monotonic',lambda:next(readings))
+    result=collect_writer_window(str(p),3600,7200,budget_seconds=0.5)
     assert result['status']=='unavailable'
     assert result['counts']=={}
 
@@ -243,3 +244,44 @@ def test_mismatched_interval_is_reported_separately():
     assert result['intervals_missing']==0
     assert result['intervals_failed']==0
     assert result['status']=='learning'
+
+
+def test_disabled_checkpoint_never_invokes_recorder_collector():
+    def forbidden(*args):
+        raise AssertionError("Recorder collector must not run while disabled")
+    result=collect_writer_checkpoint('/missing/recorder.db',0,6*HOUR,
+        enabled=False,enabled_at=None,collector=forbidden)
+    assert result is None
+    summary=disabled_writer_summary()
+    assert summary['status']=='disabled'
+    assert summary['reason']=='Recorder writer diagnostics disabled'
+    assert summary['all_recorder_rows_24h'] is None
+
+
+def test_enabled_checkpoint_invokes_existing_bounded_collector():
+    calls=[]
+    def collector(path,start,end):
+        calls.append((path,start,end))
+        return {'start_ts':start,'end_ts':end,'status':'ok','reason':'',
+                'total_rows':1,'counts':{'sensor.test':1}}
+    result=collect_writer_checkpoint('/recorder.db',6*HOUR,12*HOUR,
+        enabled=True,enabled_at=6*HOUR,collector=collector)
+    assert result['status']=='ok'
+    assert calls==[('/recorder.db',6*HOUR,12*HOUR)]
+
+
+def test_newly_enabled_checkpoint_refuses_retroactive_interval():
+    def forbidden(*args):
+        raise AssertionError("A partial pre-opt-in interval must not be queried")
+    result=collect_writer_checkpoint('/recorder.db',6*HOUR,12*HOUR,
+        enabled=True,enabled_at=6*HOUR+1,collector=forbidden)
+    assert result['status']=='unavailable'
+    assert result['total_rows'] is None
+    assert 'retroactive query refused' in result['reason']
+
+
+def test_existing_checkpoint_is_not_queried_again():
+    def forbidden(*args):
+        raise AssertionError("An immutable checkpoint must not be queried twice")
+    assert collect_writer_checkpoint('/recorder.db',6*HOUR,12*HOUR,
+        enabled=True,enabled_at=0,already_exists=True,collector=forbidden) is None

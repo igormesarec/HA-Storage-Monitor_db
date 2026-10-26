@@ -236,6 +236,39 @@ class SnapshotDB:
                     str(data.get("reason", ""))[:180],
                 ))
 
+    def configure_writer_diagnostics(self, enabled: bool, now: int) -> int | None:
+        """Persist opt-in state and return when the current enabled run began.
+
+        Ordinary restarts/reloads preserve the original timestamp. An explicit
+        disable followed by re-enable starts a new run, preventing a later
+        checkpoint from querying a Recorder interval that predates consent.
+        """
+        with _raw_connection(self.path) as db:
+            current = db.execute(
+                "SELECT value FROM metadata WHERE key='writer_diagnostics_enabled'"
+            ).fetchone()
+            if not enabled:
+                db.execute("""INSERT INTO metadata(key,value)
+                    VALUES('writer_diagnostics_enabled','0')
+                    ON CONFLICT(key) DO UPDATE SET value='0'""")
+                db.execute("DELETE FROM metadata WHERE key='writer_diagnostics_enabled_at'")
+                return None
+            if current and current[0] == "1":
+                existing = db.execute(
+                    "SELECT value FROM metadata WHERE key='writer_diagnostics_enabled_at'"
+                ).fetchone()
+                if existing:
+                    return int(existing[0])
+            enabled_at = int(now)
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('writer_diagnostics_enabled','1')
+                ON CONFLICT(key) DO UPDATE SET value='1'""")
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('writer_diagnostics_enabled_at',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (str(enabled_at),))
+            return enabled_at
+
     def writer_window_history(self, since: int, until: int) -> list[dict]:
         with _raw_connection(self.path) as db:
             db.row_factory = sqlite3.Row
