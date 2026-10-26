@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.1.2-beta.1` (25 October 2026)
+**Independent prototype:** `0.1.2-beta.2` (26 October 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -9,7 +9,7 @@
 - That SQL reading is SQLite `page_count × page_size`. It is not WAL, SHM, used disk blocks, or InfluxDB.
 - Existing Recorder repack is complete; the SI Grid Monitor Influx exclusion rules must stay unchanged. Existing Influx historic measurements since 2024 should remain intact.
 - Independent of `igormesarec/si-grid-monitor`, particularly PR #19. This monitors any supported accessible data source, without making assumptions about the integration that created it.
-- New code has **not been installed or tested against the live HA Core**. Do not reboot, restart HA, install, change settings, or delete any production data without owner approval.
+- A controlled HA Core 2026.10.4 test of `0.1.2-beta.1` exposed the executor-call failure fixed in `0.1.2-beta.2`; production data was untouched. The beta.2 hotfix has offline coverage but still requires the separately approved controlled Core restart and smoke test. Do not restart HA, change settings, or delete production data without owner approval.
 
 ## Included
 
@@ -89,7 +89,7 @@ API documentation:
 - Recorder writer diagnostic SQLite connections are explicitly closed. They remain `mode=ro`, query-only, time-index guarded, and capped by a four-second progress handler.
 - GitHub Actions workflow belongs at `.github/workflows/tests.yml` and is deliberately **not** at repository root. Workflow execution on GitHub must be verified separately.
 - GitHub/HACS icon assets in the repository root are source assets, **not proof that the HACS catalog or Home Assistant brand registry has accepted branding**. Publication to the relevant branding repository may be required.
-- This is still an offline-reviewed prototype. Terminal Supervisor access and Recorder index/query plans have been verified manually, but the integration has not been installed, restarted or tested inside HA Core.
+- This remains a controlled prototype. The beta.1 HA Core startup test found the executor-call incompatibility; beta.2 has not yet been live-tested. Terminal Supervisor access and Recorder index/query plans were verified separately and do not prove HA Core access.
 
 
 ## v0.1.2-beta.1: Four local writer checkpoints per day
@@ -139,6 +139,26 @@ an interval that began before that time is not queried or backfilled.
 a guarantee of zero memory/CPU impact. Test a single six-hour window on HA OS
 before approving production installation. InfluxDB Core permissions and
 frontend WebSocket compatibility remain unverified.
+
+## v0.1.2-beta.2: Home Assistant executor hotfix
+
+This release fixes the HA Core 2026.10.4 startup failure caused by passing
+keyword arguments directly to `HomeAssistant.async_add_executor_job()`. Calls
+to keyword-only monitor-database methods are now wrapped with
+`functools.partial()`. The audit covers disk, growth, stale-data and dashboard
+summary paths. Alert state and the six-hour notification cooldown are committed
+to the monitor's own SQLite before notification delivery is attempted, so a
+notification service failure cannot generate a retry on every hourly sample.
+
+For an existing HACS installation, download `0.1.2-beta.2` through HACS first.
+Downloading files does not activate the Python change. After separate owner
+approval, perform one controlled **Home Assistant Core restart** and verify the
+version and smoke-test results. A config-entry reload alone is appropriate for
+changing Storage Monitor options, including keeping Recorder writer diagnostics
+off, but it is not a substitute for the restart needed to import upgraded
+custom-component Python. Do not delete or replace
+`.storage/ha_storage_monitor_history.sqlite3`; the hotfix keeps its snapshots,
+writer history, alert acknowledgements and cooldown state.
 
 ## Local development tests
 

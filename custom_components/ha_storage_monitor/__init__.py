@@ -158,7 +158,8 @@ class StorageMonitor:
         window=f"{local_now.date().isoformat()}:{(local_now.hour//6)*6:02d}"
         for key in keys:
             evidence=await self.hass.async_add_executor_job(
-                self.db.growth_evidence,key,hour,hourly_source=key!="influx_addon")
+                partial(self.db.growth_evidence,key,hour,
+                        hourly_source=key!="influx_addon"))
             ev=evaluate(key,evidence["points"],hour,
                 min_excess_bytes=int(self.options.get("min_excess_mib",0))*1024*1024,
                 cadence_hours=6,
@@ -169,17 +170,23 @@ class StorageMonitor:
                 permitted=allow_notification(previous,window,hour)
                 should_notify=permitted and (not previous["active"] or bool(self.options.get("repeat_notifications",False)))
                 if should_notify:
-                    await self._notify("growth:"+key,"Storage growth warning",
+                    # Persist the cooldown before handing off to HA's
+                    # notification service. A transient service failure must
+                    # not turn an hourly sample into a notification storm.
+                    await self._set_alert(key,active=True,window=window,
+                                          now=hour,notified=True)
+                    await self._notify_safely("growth:"+key,"Storage growth warning",
                         f"{key}: last 24h +{ev.delta24/1024**2:.1f} MiB, prior 7d daily "
                         f"+{ev.baseline_daily/1024**2:.1f} MiB, "
                         f"{ev.excess_ratio*100:+.1f}% difference. Verified {local_now.isoformat()}. "
                         "Open Storage Monitor dashboard for details.")
-                await self.hass.async_add_executor_job(self.db.set_alert,key,active=True,
-                    window=window if should_notify else previous["last_window"],now=hour,notified=should_notify)
+                else:
+                    await self._set_alert(key,active=True,
+                                          window=previous["last_window"],now=hour)
             elif ev.status in ("normal","maintenance"):
                 # Maintenance resets the alert. Learning does not silently resolve it.
-                await self.hass.async_add_executor_job(self.db.set_alert,key,active=False,
-                    window=previous["last_window"],now=hour)
+                await self._set_alert(key,active=False,
+                                      window=previous["last_window"],now=hour)
 
     async def check_disk(self,samples: list[Sample],hour: int,local_now: datetime):
         sizes={s.source:s.size for s in samples if s.status=="ok"}
@@ -195,13 +202,16 @@ class StorageMonitor:
         notify=is_low and allow_notification(prev,window,hour) and (not prev["active"] or
                             bool(self.options.get("repeat_notifications",False)))
         if notify:
-            await self._notify("disk_low","CRITICAL: Home Assistant disk space",
+            await self._set_alert("disk_low",active=True,window=window,
+                                  now=hour,notified=True)
+            await self._notify_safely("disk_low","CRITICAL: Home Assistant disk space",
                 f"Free on HA /config mount: {free/1024**3:.2f} GiB, "
                 f"warning below {threshold/1024**3:.2f} GiB. Includes a minimum "
                 "space requirement equal to the Recorder DB footprint for safe repacking. "
                 "Do not delete live WAL/SHM files.")
-        await self.hass.async_add_executor_job(self.db.set_alert,"disk_low",active=is_low,
-            window=window if notify else prev["last_window"],now=hour,notified=notify)
+        else:
+            await self._set_alert("disk_low",active=is_low,
+                                  window=prev["last_window"],now=hour)
 
     async def check_stale(self,samples: list[Sample],hour: int,local_now: datetime):
         # Two missing consecutive hourly observations. Cached Influx is only
@@ -223,17 +233,34 @@ class StorageMonitor:
             notify=stale and allow_notification(previous,window,hour) and (
                  not previous["active"] or bool(self.options.get("repeat_notifications",False)))
             if notify:
-                await self._notify("stale_"+key,"Storage Monitor measurement unavailable",
+                await self._set_alert("stale:"+key,active=True,window=window,
+                                      now=hour,notified=True)
+                await self._notify_safely("stale_"+key,"Storage Monitor measurement unavailable",
                     f"{key} has missed two consecutive hourly samples. "
                     "Treat its size as unknown, not zero. Check permissions and monitoring status.")
             if stale or fresh:
-                await self.hass.async_add_executor_job(self.db.set_alert,"stale:"+key,
-                    active=stale, window=window if notify else previous["last_window"],
-                    now=hour,notified=notify)
+                if not notify:
+                    await self._set_alert("stale:"+key,active=stale,
+                                          window=previous["last_window"],now=hour)
+
+    async def _set_alert(self,source: str,*,active: bool,window: str | None,
+                         now: int,notified: bool=False):
+        """Write only to the monitor DB using HA's positional executor API."""
+        await self.hass.async_add_executor_job(partial(
+            self.db.set_alert,source,active=active,window=window,now=now,
+            notified=notified))
 
     async def _notify(self,ident,title,message):
         await self.hass.services.async_call("persistent_notification","create",
              {"title":title,"message":message,"notification_id":"ha_storage_monitor_"+ident.replace(":","_")},blocking=False)
+
+    async def _notify_safely(self,ident,title,message):
+        """Deliver after durable cooldown state; do not retry on every sample."""
+        try:
+            await self._notify(ident,title,message)
+        except Exception:
+            _LOGGER.exception(
+                "Storage Monitor notification delivery failed; cooldown persisted")
 
     async def summary(self):
         now=utc_hour(int(time.time()))
@@ -249,7 +276,8 @@ class StorageMonitor:
             alerts[key]=await self.hass.async_add_executor_job(self.db.get_alert,key)
             if key in GROWTH_SOURCES or key.startswith("database:"):
                 evidence=await self.hass.async_add_executor_job(
-                    self.db.growth_evidence,key,checkpoint_end,hourly_source=key!="influx_addon")
+                    partial(self.db.growth_evidence,key,checkpoint_end,
+                            hourly_source=key!="influx_addon"))
                 growth[key]=evaluate(key,evidence["points"],checkpoint_end,cadence_hours=6,
                     observed_shrink=evidence["observed_shrink"],
                     hourly_coverage_ok=evidence["hourly_coverage_ok"]).as_json()
