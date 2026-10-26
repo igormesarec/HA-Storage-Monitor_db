@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.1.1-beta.1` (25 October 2026)
+**Independent prototype:** `0.1.2-beta.1` (25 October 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -17,7 +17,7 @@
 - `engine.py`: 1-hour UTC-identity snapshots, 1y/2y/forever retention, persistent alerts/acknowledgments, strict growth threshold.
 - `sources.py`: Recorder main + WAL + SHM apparent/allocated file bytes, bounded generic SQLite file discovery (`*.db`, `*.sqlite`, `*.sqlite3`) in `/config` and `/config/.storage` at directory depth one, additional local SQLite files aggregated separately; excludes Recorder and the monitor snapshot database, HA `/config` filesystem capacity.
 - `supervisor.py`: 6-hour interval Supervisor `GET /host/disks/default/usage?max_depth=2` for specific `a0d7b954_influxdb` subtree. Returns `unavailable`, **not zero**, without exact authorized size. Accepts `apps_data` and `addons_data` Supervisor IDs. This may represent other components in the same InfluxDB add-on, not solely TSM shard files.
-- `writers.py`: read-only Recorder SQL, four-second per-query timeout, existing time index guard, top 20 entities by 24h state-row counts with last-hour counts, previous seven-day average, registry platform attribution where available; grouped by integration **for top20 only**, not all recorder writes.
+- `writers.py`: one bounded read-only Recorder SQL query per local six-hour checkpoint, existing timestamp index guard, 4-second progress budget, and compact counts stored in our own SQLite. The dashboard aggregates four saved windows for a local-day ranking and 32 for an eight-day comparison. No one-hour writer metric is claimed. Grouping by integration covers **only the top 20** displayed entities.
 - `frontend/storage-monitor-card.js`: responsive light/dark HA dashboard with Overview, Growth & Alarms, Top Writers, Settings / Access; real sampled history 1/7/30/90 days; language switch EN/SL; manual refresh; no cloud dependencies.
 - `tests/`: offline, deterministic Python tests. These are **not** a replacement for HA OS integration tests.
 
@@ -47,7 +47,7 @@ These are instructions only, **not actions already performed**.
 6. In Settings > Dashboards, create a **NEW** dashboard named `Storage Monitor` with its own sidebar entry, and add its JavaScript module resource URL: `/ha_storage_monitor/storage-monitor-card.js`. Paste the one-view YAML from `lovelace-dashboard-example.yaml`, or add `custom:ha-storage-monitor-card` manually. Dashboard is admin-only by design because it contains filesystem and entity diagnostics.
 7. Confirm the measured `Recorder SQLite` main-file value versus original SQL reading, check `Recorder WAL` and `Recorder SHM` separately, check `/config` disk scope, ensure Influx size is either exact `InfluxDB add-on total` or visibly unavailable, and discover additional readable local SQLite database filenames.
 8. Read the `Growth & alarms` page: it will show `learning` for the first eight days. **Do not force-fill eight days of fake history.** Independent disk-low warnings can trigger immediately.
-9. Confirm `Top writers` query remains under four seconds; if it times out it safely returns `unavailable`. Check HA logs and do not add indexes to production Recorder.
+9. Confirm the **six-hour** Recorder writer query remains within its four-second progress budget. If it times out, the window is recorded `unavailable` and no incomplete counts are presented as complete. Check HA logs and do not add indexes to production Recorder.
 10. Roll back by removing the Storage Monitor config entry and dashboard resource through HA UI. Any file deletion or HA restart should be separately approved. The original SQL sensor and production databases remain unchanged.
 
 ## Scope of generic local SQL file discovery
@@ -57,9 +57,9 @@ These are instructions only, **not actions already performed**.
 - Existing Recorder SQL sensor is preserved, and our own monitoring history DB is excluded to prevent recursive monitoring growth.
 - A discovered database file is monitored using filesystem metadata, not opened for SQL queries, and no production database is ever edited.
 
-## Read-only capability probe, BEFORE Influx can be marked verified
+## Read-only capability probe, Terminal access verified, Core access pending
 
-Use `capability-probe.sh` once in Terminal & SSH (only with user approval). This sends a single read-only GET, does not print the token, and does not touch Influx data. The Terminal & SSH app's Supervisor API role may differ from Home Assistant Core, so a Terminal permission failure is **not** definitive proof the integration lacks permission.
+A read-only Supervisor GET from Terminal & SSH succeeded on 2026-10-25. `capability-probe.sh` documents the same supported method and must not be run repeatedly without need. Terminal & SSH permissions may differ from Home Assistant Core, so Core access must still be validated after explicit installation approval.
 
 On supported Supervisor versions the response has top-level `apps_data` (newer) or `addons_data` (legacy). The subtree whose `id` ends exactly `a0d7b954_influxdb` must have a real numeric `used_bytes`. If absent, the dashboard must show `Unavailable`, not an inference from series count, InfluxQL, or a backup's size.
 
@@ -70,8 +70,8 @@ API documentation:
 
 ## Limits and known gaps, deliberately not claimed as completed
 
-- No live HA OS/Supervisor permission proof or live InfluxDB footprint is available here. The 6.61 GB historical Influx figure is **not** a new measurement.
-- Main Recorder logical SQL sensor still reports 5,247.2 MiB at the known check; actual filesystem main file, WAL, SHM, additional local database files and free disk sizes have not been measured by this prototype on your machine.
+- On 2026-10-25, Terminal & SSH obtained a successful Supervisor API response for the exact InfluxDB add-on subtree: **7,287,276,210 bytes (6.79 GiB)**. This is add-on data usage, not TSM-only bytes. **Access from HA Core remains unverified.**
+- Existing SQL sensor showed 5,247.2 MiB at the earlier check. Terminal & SSH separately showed a Recorder main file about 5.1 GiB, WAL 7.4 MiB and SHM 32 KiB on 2026-10-25. These are not measurements produced by the integration; Core integration measurement remains unverified.
 - No production HA files, databases, YAML, retention, indexes, PR #19, exclusions, or backups were modified.
 - No automation that purges, shrinks or repairs DBs. No high-rate sensors; all measurements in own local SQLite, not in Influx. No installed custom sidebar registration; the separate sidebar dashboard is created through supported Home Assistant UI.
 - Dedicated Supervisor host disk (`/host/info`) vs `/config` filesystem used/free breakdown not yet cross-validated. Labels show scope.
@@ -88,7 +88,50 @@ API documentation:
 - Recorder writer diagnostic SQLite connections are explicitly closed. They remain `mode=ro`, query-only, time-index guarded, and capped by a four-second progress handler.
 - GitHub Actions workflow belongs at `.github/workflows/tests.yml` and is deliberately **not** at repository root. Workflow execution on GitHub must be verified separately.
 - GitHub/HACS icon assets in the repository root are source assets, **not proof that the HACS catalog or Home Assistant brand registry has accepted branding**. Publication to the relevant branding repository may be required.
-- This is still an offline-reviewed prototype. No live HA OS permission test, install, or restart has been performed.
+- This is still an offline-reviewed prototype. Terminal Supervisor access and Recorder index/query plans have been verified manually, but the integration has not been installed, restarted or tested inside HA Core.
+
+
+## v0.1.2-beta.1: Four local writer checkpoints per day
+
+The earlier version queried eight days of Recorder rows at each 6-hour alarm check.
+That design is retired. v0.1.2 reads **only the interval since the previous
+local 00/06/12/18 checkpoint** from Recorder. Each read uses the existing
+`ix_states_last_updated_ts` index, SQLite read-only/query-only mode, a 4-second
+progress-interrupt budget, in-memory grouping, and caps on the number and
+serialized size of entity counts. A timeout, missing index, or cap exceedance
+records **unavailable**, never partial totals. No production indexes are added.
+
+Each completed 6-hour local interval is stored **once** in the independent
+`/config/.storage/ha_storage_monitor_history.sqlite3` table `writer_windows`.
+The dashboard reads only these saved summaries. Four local checkpoints produce
+a local-day ranking; 32 intervals produce the preceding 8-day writer baseline.
+Detailed entity counts are kept for 9 days, while hourly **file size** snapshots
+retain the configured 365/730-day history. The old `writers` table is no longer
+used and is not migrated as valid six-hour evidence. A missing interval is
+never fabricated or backfilled by rescanning eight days of Recorder.
+
+**Size growth calculation:** Hourly sizes are still saved for charts and
+reliability checks. Each six-hour growth evaluation retrieves only **33 UTC
+six-hour checkpoint values** from the monitor's own SQLite (four per day
+plus the starting boundary). Two small SQL checks against that same monitor
+SQLite verify hourly coverage and detect a measured shrink between checkpoints.
+No Recorder history is queried for size-growth calculations.
+
+**DST:** A local 00-to-06 window may span 5 or 7 elapsed hours. The UI
+labels the number of elapsed hours and calls the result a local day, **not**
+a strict 24-hour measurement on those transitions. The original storage-size
+alert continues to use strict 24-hour UTC elapsed windows and remains separate.
+
+**Writer learning:** A complete local-day ranking requires four verified
+intervals. Prior-week comparison requires 32 consecutive verified intervals.
+A query timeout, missed HA shutdown checkpoint, or permission failure keeps
+comparisons in learning until a clean eight-day window exists. Entity row counts
+are not attributable physical bytes. No additional SQL sensor is created.
+
+**Operational caution:** The 4-second limit is a query progress budget, not
+a guarantee of zero memory/CPU impact. Test a single six-hour window on HA OS
+before approving production installation. InfluxDB Core permissions and
+frontend WebSocket compatibility remain unverified.
 
 ## Local development tests
 
