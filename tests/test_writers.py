@@ -50,6 +50,8 @@ def test_missing_window_never_misrepresents_complete_24h():
     records=windows(end)[1:]
     result=summarize_writer_windows(records,int(end.timestamp()))
     assert result['status']=='learning'
+    assert result['intervals_missing']==1
+    assert result['intervals_failed']==0
     assert not result['last24_complete']
     assert result['entities']==[]
     assert result['all_recorder_rows_24h'] is None
@@ -73,6 +75,8 @@ def test_failed_interval_is_not_counted_as_verified():
     records[0]['status']='unavailable'
     result=summarize_writer_windows(records,int(end.timestamp()))
     assert result['intervals_verified']==31
+    assert result['intervals_failed']==1
+    assert result['intervals_missing']==0
     assert not result['last24_complete']
 
 
@@ -200,3 +204,42 @@ def test_non_destructive_v1_monitor_store_upgrade(tmp_path):
     with sqlite3.connect(p) as db:
         assert db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0]=='2'
         assert db.execute('SELECT hour FROM writers').fetchone()[0]==42
+
+
+def test_row_safety_cap_fails_closed_without_partial_results(tmp_path):
+    p=tmp_path/'recorder.db';create_test_recorder(p)
+    result=collect_writer_window(str(p),3600,7200,max_rows=2)
+    assert result['status']=='unavailable'
+    assert result['total_rows'] is None
+    assert result['counts']=={}
+    assert 'row safety cap' in result['reason'].lower()
+
+
+def test_invalid_caps_fail_closed(tmp_path):
+    p=tmp_path/'recorder.db';create_test_recorder(p)
+    for kwargs in ({'max_rows':0},{'max_entities':0},{'max_json_bytes':0}):
+        assert collect_writer_window(str(p),3600,7200,**kwargs)['status']=='unavailable'
+
+
+def test_writer_query_does_not_need_temporary_grouping(tmp_path):
+    p=tmp_path/'recorder.db';create_test_recorder(p)
+    with sqlite3.connect(f'file:{p}?mode=ro',uri=True) as db:
+        plan=' '.join(str(x[3]) for x in db.execute("""
+            EXPLAIN QUERY PLAN SELECT m.entity_id
+            FROM states AS s INDEXED BY ix_states_last_updated_ts
+            JOIN states_meta AS m ON m.metadata_id=s.metadata_id
+            WHERE s.last_updated_ts >= 3600 AND s.last_updated_ts < 7200
+        """))
+    assert 'USING INDEX ix_states_last_updated_ts' in plan
+    assert 'TEMP B-TREE' not in plan
+
+
+def test_mismatched_interval_is_reported_separately():
+    end=checkpoint()
+    records=windows(end)
+    records[0]['start_ts']+=1
+    result=summarize_writer_windows(records,int(end.timestamp()))
+    assert result['intervals_mismatched']==1
+    assert result['intervals_missing']==0
+    assert result['intervals_failed']==0
+    assert result['status']=='learning'

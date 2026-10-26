@@ -62,3 +62,46 @@ def test_cached_measurements_cannot_form_verified_baseline(tmp_path):
     e=db.growth_evidence('recorder_total',T,hourly_source=True)
     assert len(e['points'])==33
     assert all(x['status']=='ok' for x in e['points'])
+
+
+def test_influx_local_checkpoints_across_dst_fail_closed(tmp_path):
+    """Do not invent an exact elapsed 24h value across a shifted UTC phase."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    tz=ZoneInfo('Europe/Ljubljana')
+    end=datetime(2026,10,30,18,tzinfo=tz)
+    db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()
+    samples=[]
+    for i in range(33):
+        local=end-timedelta(hours=6*i)
+        hour=int(local.timestamp())//HOUR*HOUR
+        samples.append(Sample(hour,'influx_addon',int((10_000-i*50)*MiB),
+                              'ok','supervisor',hour))
+    db.save(samples)
+    now=int(end.timestamp())//HOUR*HOUR
+    evidence=db.growth_evidence('influx_addon',now,hourly_source=False)
+    result=evaluate('influx_addon',evidence['points'],now,cadence_hours=6,
+                    observed_shrink=evidence['observed_shrink'])
+    assert result.status=='learning'
+    assert len(evidence['points']) < 33
+
+
+def test_influx_local_checkpoints_after_dst_rebuild_clean_baseline(tmp_path):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    tz=ZoneInfo('Europe/Ljubljana')
+    end=datetime(2026,11,10,18,tzinfo=tz)
+    db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()
+    samples=[]
+    for i in range(33):
+        local=end-timedelta(hours=6*i)
+        hour=int(local.timestamp())//HOUR*HOUR
+        samples.append(Sample(hour,'influx_addon',int((10_000-i*50)*MiB),
+                              'ok','supervisor',hour))
+    db.save(samples)
+    now=int(end.timestamp())//HOUR*HOUR
+    evidence=db.growth_evidence('influx_addon',now,hourly_source=False)
+    result=evaluate('influx_addon',evidence['points'],now,cadence_hours=6,
+                    observed_shrink=evidence['observed_shrink'])
+    assert len(evidence['points'])==33
+    assert result.status=='normal'

@@ -21,6 +21,8 @@ HOUR = 3600
 # Fail rather than silently truncate entity rankings or inflate monitor storage.
 MAX_ENTITIES = 5000
 MAX_JSON_BYTES = 256 * 1024
+# A hard cap on rows visited avoids sustained Recorder reads during a write storm.
+MAX_ROWS = 500_000
 
 
 def local_checkpoint_window(when: datetime) -> tuple[int, int]:
@@ -47,17 +49,22 @@ def _failed(start: int, end: int, reason: str) -> dict:
 def collect_writer_window(recorder_file: str, start: int, end: int, *,
                           budget_seconds: float = 4.0,
                           max_entities: int = MAX_ENTITIES,
-                          max_json_bytes: int = MAX_JSON_BYTES) -> dict:
+                          max_json_bytes: int = MAX_JSON_BYTES,
+                          max_rows: int = MAX_ROWS) -> dict:
     """Collect a COMPLETE interval, or return unavailable (never partial).
 
     Uses the existing Recorder timestamp index and SQLite progress handler.
     No CREATE/UPDATE/PRAGMA changes to Recorder; no new production indexes.
-    A time limit bounds execution time, not absolute SQLite memory usage.
+    Stream matching entity IDs instead of creating a GROUP BY temporary B-tree.
+    Bound wall time, scanned rows, distinct entities, and serialized output.
+    Failure produces an unavailable interval, never an incomplete ranking.
     """
     if not 0 < end - start <= 7 * HOUR:
         return _failed(start, end, "Invalid or overly broad time window")
     if budget_seconds <= 0:
         return _failed(start, end, "Nonpositive execution budget")
+    if max_rows < 1 or max_entities < 1 or max_json_bytes < 1:
+        return _failed(start, end, "Invalid safety cap")
     target = Path(recorder_file)
     if target.is_symlink() or not target.is_file():
         return _failed(start, end, "Recorder SQLite file unavailable")
@@ -66,34 +73,43 @@ def collect_writer_window(recorder_file: str, start: int, end: int, *,
         with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as db:
             db.execute("PRAGMA query_only=ON")
             db.execute("PRAGMA busy_timeout=500")
-            # Keep GROUP BY's temporary B-tree in process memory, not in a
-            # potentially large on-disk temp file. Connection-local only.
-            db.execute("PRAGMA temp_store=MEMORY")
             indexes = {r[1] for r in db.execute("PRAGMA index_list('states')")}
             if INDEX not in indexes:
                 return _failed(start, end, "Required time index missing; scan refused")
             deadline = time.monotonic() + budget_seconds
             db.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
             try:
-                # GROUP BY necessarily aggregates qualifying rows. No ORDER BY,
-                # no 8-day scan, and no LIMIT that would hide incomplete totals.
+                if time.monotonic() >= deadline:
+                    return _failed(start, end, "Recorder read time budget exceeded")
+                # Index-bounded streaming query. No GROUP BY, ORDER BY, or
+                # SQLite temporary B-tree; Python counters have explicit caps.
                 cursor = db.execute(f"""
-                    SELECT m.entity_id, COUNT(*)
+                    SELECT m.entity_id
                     FROM states AS s INDEXED BY {INDEX}
                     JOIN states_meta AS m ON m.metadata_id = s.metadata_id
                     WHERE s.last_updated_ts >= ? AND s.last_updated_ts < ?
-                    GROUP BY s.metadata_id
                 """, (start, end))
                 counts: dict[str, int] = {}
-                for entity_id, count in cursor:
-                    if len(counts) >= max_entities:
-                        return _failed(start, end, "Entity count safety cap reached; not a complete ranking")
-                    counts[str(entity_id)] = int(count)
+                total_rows = 0
+                for (entity_id,) in cursor:
+                    total_rows += 1
+                    if total_rows > max_rows:
+                        return _failed(start, end, "Recorder row safety cap reached; no partial ranking")
+                    # The SQLite progress handler checks the deadline during
+                    # execution. Check it here as well between cursor steps.
+                    if total_rows % 256 == 0 and time.monotonic() >= deadline:
+                        return _failed(start, end, "Recorder read time budget exceeded")
+                    name = str(entity_id)
+                    if name not in counts and len(counts) >= max_entities:
+                        return _failed(start, end, "Entity count safety cap reached; no partial ranking")
+                    counts[name] = counts.get(name, 0) + 1
+                if time.monotonic() >= deadline:
+                    return _failed(start, end, "Recorder read time budget exceeded")
                 payload = json.dumps(counts, separators=(",", ":"))
                 if len(payload.encode("utf-8")) > max_json_bytes:
                     return _failed(start, end, "Summary storage safety cap reached")
                 return {"start_ts": start, "end_ts": end, "status": "ok",
-                        "reason": "", "total_rows": sum(counts.values()), "counts": counts}
+                        "reason": "", "total_rows": total_rows, "counts": counts}
             finally:
                 db.set_progress_handler(None, 0)
     except (sqlite3.Error, OSError) as err:
@@ -112,12 +128,21 @@ def summarize_writer_windows(rows: list[dict], end_ts: int) -> dict:
         return {"status": "unavailable", "reason": "Not at a scheduled checkpoint", "entities": []}
     by_end = {int(row["end_ts"]): row for row in rows}
     valid: list[dict | None] = []
+    missing_intervals = 0
+    failed_intervals = 0
+    mismatched_intervals = 0
     for i in range(32):
         checkpoint = end_local - timedelta(hours=6 * i)
         expected_start, expected_end = local_checkpoint_window(checkpoint)
         row = by_end.get(expected_end)
-        if (row is None or row["status"] != "ok" or
-                int(row["start_ts"]) != expected_start):
+        if row is None:
+            missing_intervals += 1
+            valid.append(None)
+        elif row["status"] != "ok":
+            failed_intervals += 1
+            valid.append(None)
+        elif int(row["start_ts"]) != expected_start:
+            mismatched_intervals += 1
             valid.append(None)
         else:
             valid.append(row)
@@ -173,6 +198,9 @@ def summarize_writer_windows(rows: list[dict], end_ts: int) -> dict:
                   else f"Verified {available}/32 local six-hour intervals; no partial totals represented as full history",
         "intervals_verified": available,
         "intervals_required": 32,
+        "intervals_missing": missing_intervals,
+        "intervals_failed": failed_intervals,
+        "intervals_mismatched": mismatched_intervals,
         "last24_complete": last24 is not None,
         "previous7_complete": previous7 is not None,
         "last24_elapsed_hours": last24_hours,
