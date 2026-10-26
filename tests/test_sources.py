@@ -1,6 +1,6 @@
 from ha_storage_monitor.sources import collect_local
 from ha_storage_monitor.supervisor import extract_addon_usage
-from ha_storage_monitor.writers import top_writers
+from ha_storage_monitor.writers import collect_writer_window
 from pathlib import Path
 import sqlite3
 
@@ -44,18 +44,17 @@ def test_writer_query_uses_index_and_returns_counts(tmp_path):
         db.execute('CREATE INDEX ix_states_last_updated_ts ON states(last_updated_ts)')
         db.executemany('INSERT INTO states_meta VALUES(?,?)',[(1,'sensor.a'),(2,'sensor.b')])
         db.executemany('INSERT INTO states(metadata_id,last_updated_ts) VALUES(?,?)',[(1,10000),(1,10001),(2,10002),(1,10003)])
-    now=10020
-    result=top_writers(str(dbp),now)
+    result=collect_writer_window(str(dbp),10000,10020)
     assert result['status']=='ok'
-    assert result['entities'][0]['entity_id']=='sensor.a'
-    assert result['entities'][0]['rows_24h']==3
+    assert result['counts']['sensor.a']==3
+    assert result['total_rows']==4
 
 
 def test_missing_index_refuses_expensive_full_scan(tmp_path):
     dbp=tmp_path/'home-assistant_v2.db'
     with sqlite3.connect(dbp) as db:
         db.execute('CREATE TABLE states(state_id INTEGER PRIMARY KEY, metadata_id INTEGER, last_updated_ts REAL)')
-    assert top_writers(str(dbp),10000)['status']=='unavailable'
+    assert collect_writer_window(str(dbp),9999,10000)['status']=='unavailable'
 
 
 def test_new_supervisor_v2_apps_data_key():
