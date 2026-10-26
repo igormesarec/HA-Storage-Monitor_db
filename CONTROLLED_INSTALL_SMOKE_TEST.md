@@ -5,13 +5,13 @@ This checklist is documentation only. Installation, file copying and the require
 ## Initial installation: writer diagnostics off
 
 1. Confirm an ordinary Home Assistant backup exists using the owner's established process.
-2. Install or update **Home Assistant Storage Monitor `0.1.2-beta.2`** through HACS (or copy only `custom_components/ha_storage_monitor` into the corresponding `/config/custom_components` directory). Downloading files does not activate new Python code.
+2. Install or update **Home Assistant Storage Monitor `0.1.2-beta.3`** through HACS (or copy only `custom_components/ha_storage_monitor` into the corresponding `/config/custom_components` directory). Downloading files does not activate new Python or JavaScript code.
 3. After separate owner approval, perform one controlled Home Assistant Core restart. A config-entry reload alone does not import upgraded custom-component Python.
 4. For a new installation, add **Home Assistant Storage Monitor** from Settings > Devices & Services. For an update, confirm the existing config entry and `.storage/ha_storage_monitor_history.sqlite3` remain in place; do not delete or recreate them.
 5. Leave **Enable bounded Recorder writer diagnostics** off. It defaults to off.
-6. Add or retain the dashboard resource/card only after the integration loads without errors.
+6. Add or retain the dashboard resource/card only after the integration loads without errors. Hard-refresh the dashboard once after the approved restart so the browser does not retain the beta.2 JavaScript resource.
 7. Verify the Top Writers view says **Recorder writer diagnostics disabled**. It must not show zero rows or a fabricated ranking.
-8. Verify Home Assistant logs do not contain `async_add_executor_job() got an unexpected keyword argument` or `Storage Monitor sample failed` during the startup sample.
+8. Verify Home Assistant logs do not contain `async_add_executor_job() got an unexpected keyword argument` or `Storage Monitor sample failed` during the startup sample. Verify the browser console does not contain `The result must not have attributes` and Lovelace does not report `setConfig is not a function`.
 9. Verify the following continue independently:
    - Recorder main/WAL/SHM apparent sizes and their total;
    - `/config` disk total/free/used scope;

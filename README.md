@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.1.2-beta.2` (26 October 2026)
+**Independent prototype:** `0.1.2-beta.3` (26 October 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -9,7 +9,7 @@
 - That SQL reading is SQLite `page_count × page_size`. It is not WAL, SHM, used disk blocks, or InfluxDB.
 - Existing Recorder repack is complete; the SI Grid Monitor Influx exclusion rules must stay unchanged. Existing Influx historic measurements since 2024 should remain intact.
 - Independent of `igormesarec/si-grid-monitor`, particularly PR #19. This monitors any supported accessible data source, without making assumptions about the integration that created it.
-- A controlled HA Core 2026.10.4 test of `0.1.2-beta.1` exposed the executor-call failure fixed in `0.1.2-beta.2`; production data was untouched. The beta.2 hotfix has offline coverage but still requires the separately approved controlled Core restart and smoke test. Do not restart HA, change settings, or delete production data without owner approval.
+- Controlled HA OS 2026.10.4 tests exposed the beta.1 executor-call failure and the beta.2 frontend custom-element construction failure. Beta.3 fixes both known runtime blockers; production data was untouched. The beta.3 frontend hotfix has offline DOM coverage but still requires a separately approved controlled Core restart and smoke test. Do not restart HA, change settings, or delete production data without owner approval.
 
 ## Included
 
@@ -89,7 +89,7 @@ API documentation:
 - Recorder writer diagnostic SQLite connections are explicitly closed. They remain `mode=ro`, query-only, time-index guarded, and capped by a four-second progress handler.
 - GitHub Actions workflow belongs at `.github/workflows/tests.yml` and is deliberately **not** at repository root. Workflow execution on GitHub must be verified separately.
 - GitHub/HACS icon assets in the repository root are source assets, **not proof that the HACS catalog or Home Assistant brand registry has accepted branding**. Publication to the relevant branding repository may be required.
-- This remains a controlled prototype. The beta.1 HA Core startup test found the executor-call incompatibility; beta.2 has not yet been live-tested. Terminal Supervisor access and Recorder index/query plans were verified separately and do not prove HA Core access.
+- This remains a controlled prototype. HA Core testing found and confirmed the beta.1 executor-call incompatibility; browser testing of beta.2 then found the reflected `HTMLElement.lang` constructor violation. Beta.3 has not yet been live-tested. Terminal Supervisor access and Recorder index/query plans were verified separately and do not prove HA Core access.
 
 
 ## v0.1.2-beta.1: Four local writer checkpoints per day
@@ -160,12 +160,30 @@ custom-component Python. Do not delete or replace
 `.storage/ha_storage_monitor_history.sqlite3`; the hotfix keeps its snapshots,
 writer history, alert acknowledgements and cooldown state.
 
+## v0.1.2-beta.3: Lovelace custom-element initialization hotfix
+
+The card now stores its language choice in the component-owned `_language`
+property instead of assigning `HTMLElement.lang` during construction. The
+previous assignment reflected a `lang` HTML attribute before the custom-element
+constructor returned, which browsers reject with `NotSupportedError` and leaves
+Lovelace without a working `setConfig()` method.
+
+The frontend test suite now evaluates the shipped card in jsdom, registers the
+custom element, constructs it through
+`document.createElement('ha-storage-monitor-card')`, configures it, assigns a
+fake Home Assistant connection, switches Slovenian/English, and exercises
+disconnect/reconnect timer cleanup. CI retains `node --check`, but the DOM test
+is mandatory because syntax validation alone cannot detect constructor-rule
+violations.
+
 ## Local development tests
 
 ```sh
 python -m pytest tests -q
 python -m compileall -q custom_components/ha_storage_monitor
 node --check custom_components/ha_storage_monitor/frontend/storage-monitor-card.js
+pnpm install --frozen-lockfile
+pnpm test:frontend
 ```
 
 Safety principle: monitoring must never become the new high-writing integration.

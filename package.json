@@ -1,0 +1,12 @@
+{
+  "name": "ha-storage-monitor-frontend-tests",
+  "private": true,
+  "packageManager": "pnpm@11.25.0",
+  "type": "module",
+  "scripts": {
+    "test:frontend": "node --test tests/frontend/*.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "30.1.3"
+  }
+}
