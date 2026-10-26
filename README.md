@@ -17,7 +17,7 @@
 - `engine.py`: 1-hour UTC-identity snapshots, 1y/2y/forever retention, persistent alerts/acknowledgments, strict growth threshold.
 - `sources.py`: Recorder main + WAL + SHM apparent/allocated file bytes, bounded generic SQLite file discovery (`*.db`, `*.sqlite`, `*.sqlite3`) in `/config` and `/config/.storage` at directory depth one, additional local SQLite files aggregated separately; excludes Recorder and the monitor snapshot database, HA `/config` filesystem capacity.
 - `supervisor.py`: 6-hour interval Supervisor `GET /host/disks/default/usage?max_depth=2` for specific `a0d7b954_influxdb` subtree. Returns `unavailable`, **not zero**, without exact authorized size. Accepts `apps_data` and `addons_data` Supervisor IDs. This may represent other components in the same InfluxDB add-on, not solely TSM shard files.
-- `writers.py`: one bounded read-only Recorder SQL query per local six-hour checkpoint, existing timestamp index guard, 4-second progress budget, and compact counts stored in our own SQLite. The dashboard aggregates four saved windows for a local-day ranking and 32 for an eight-day comparison. No one-hour writer metric is claimed. Grouping by integration covers **only the top 20** displayed entities.
+- `writers.py`: one bounded read-only Recorder SQL query per local six-hour checkpoint, existing timestamp index guard, 4-second progress budget, 500,000-row/5,000-entity/256-KiB payload caps, and compact counts stored in our own SQLite. The query streams indexed rows without SQL `GROUP BY` or a temporary grouping B-tree. The dashboard aggregates four saved windows for a local-day ranking and 32 for an eight-day comparison. No one-hour writer metric is claimed. Grouping by integration covers **only the top 20** displayed entities.
 - `frontend/storage-monitor-card.js`: responsive light/dark HA dashboard with Overview, Growth & Alarms, Top Writers, Settings / Access; real sampled history 1/7/30/90 days; language switch EN/SL; manual refresh; no cloud dependencies.
 - `tests/`: offline, deterministic Python tests. These are **not** a replacement for HA OS integration tests.
 
@@ -77,6 +77,7 @@ API documentation:
 - Dedicated Supervisor host disk (`/host/info`) vs `/config` filesystem used/free breakdown not yet cross-validated. Labels show scope.
 - No Recorder `PRAGMA freelist_count` periodical breakdown yet. No separately measured actual backup archive sizes, per-table exact physical byte usage, or per-entity attributable disk bytes (impossible to assert from state counts alone).
 - No live measured query benchmark against the 5.11 GiB Recorder database yet. Query self-cancels at four seconds; a timed-out query returns unavailable.
+- Storage overhead has not been measured on HA OS. An offline synthetic test modeling 12 hourly sources for 365 days plus 36 retained six-hour writer summaries with 100 entities each produced a 7,131,136-byte SQLite file (about 6.80 MiB) on the test platform. This supports, but does not guarantee, the `<10 MiB/year` normal-load target; more discovered databases, longer labels, filesystem allocation and near-cap writer payloads increase usage.
 - Admin-only WebSocket command and panel integration still require a live Home Assistant API compatibility check; not certified ready for unattended production deployment.
 - Notification transport is HA persistent_notification, optional phone/mobile destinations and incident timeline UI are future work.
 
@@ -97,8 +98,9 @@ The earlier version queried eight days of Recorder rows at each 6-hour alarm che
 That design is retired. v0.1.2 reads **only the interval since the previous
 local 00/06/12/18 checkpoint** from Recorder. Each read uses the existing
 `ix_states_last_updated_ts` index, SQLite read-only/query-only mode, a 4-second
-progress-interrupt budget, in-memory grouping, and caps on the number and
-serialized size of entity counts. A timeout, missing index, or cap exceedance
+progress-interrupt budget, row streaming without SQL grouping, and hard caps of
+500,000 rows, 5,000 entity IDs and 256 KiB serialized counts. A timeout,
+missing index, or cap exceedance
 records **unavailable**, never partial totals. No production indexes are added.
 
 Each completed 6-hour local interval is stored **once** in the independent
@@ -142,3 +144,7 @@ node --check custom_components/ha_storage_monitor/frontend/storage-monitor-card.
 ```
 
 Safety principle: monitoring must never become the new high-writing integration.
+
+### Safety preflight for the v0.1.2 writer collector
+
+Before enabling writer diagnostics on HA OS, follow [the bounded read-only Recorder preflight](RECORDER_PREFLIGHT_READONLY.md). The collector streams indexed rows without a temporary `GROUP BY` tree and refuses incomplete intervals if its wall-time, row-count, entity-count, or JSON-size limit is reached. DST transitions can leave InfluxDB growth in learning mode until a complete eight-day exact-UTC baseline is available.
