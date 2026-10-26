@@ -17,7 +17,7 @@
 - `engine.py`: 1-hour UTC-identity snapshots, 1y/2y/forever retention, persistent alerts/acknowledgments, strict growth threshold.
 - `sources.py`: Recorder main + WAL + SHM apparent/allocated file bytes, bounded generic SQLite file discovery (`*.db`, `*.sqlite`, `*.sqlite3`) in `/config` and `/config/.storage` at directory depth one, additional local SQLite files aggregated separately; excludes Recorder and the monitor snapshot database, HA `/config` filesystem capacity.
 - `supervisor.py`: 6-hour interval Supervisor `GET /host/disks/default/usage?max_depth=2` for specific `a0d7b954_influxdb` subtree. Returns `unavailable`, **not zero**, without exact authorized size. Accepts `apps_data` and `addons_data` Supervisor IDs. This may represent other components in the same InfluxDB add-on, not solely TSM shard files.
-- `writers.py`: one bounded read-only Recorder SQL query per local six-hour checkpoint, existing timestamp index guard, 4-second progress budget, 500,000-row/5,000-entity/256-KiB payload caps, and compact counts stored in our own SQLite. The query streams indexed rows without SQL `GROUP BY` or a temporary grouping B-tree. The dashboard aggregates four saved windows for a local-day ranking and 32 for an eight-day comparison. No one-hour writer metric is claimed. Grouping by integration covers **only the top 20** displayed entities.
+- `writers.py`: optional bounded Recorder diagnostics, **disabled by default**. While disabled, Recorder is never opened for entity-writer queries and the dashboard reports `Recorder writer diagnostics disabled`, not zero rows. When explicitly enabled, one read-only query runs per local six-hour checkpoint with the existing timestamp index guard, 4-second progress budget, 500,000-row/5,000-entity/256-KiB payload caps, and compact counts stored in our own SQLite. The query streams indexed rows without SQL `GROUP BY` or a temporary grouping B-tree. No missed or pre-opt-in interval is queried retroactively.
 - `frontend/storage-monitor-card.js`: responsive light/dark HA dashboard with Overview, Growth & Alarms, Top Writers, Settings / Access; real sampled history 1/7/30/90 days; language switch EN/SL; manual refresh; no cloud dependencies.
 - `tests/`: offline, deterministic Python tests. These are **not** a replacement for HA OS integration tests.
 
@@ -43,12 +43,12 @@ These are instructions only, **not actions already performed**.
 2. Determine its automatic polling setting at **Settings > Devices & services > SQL > three-dot menu > System options**. Home Assistant SQL normally polls every 30 seconds. If approved, disable `Enable polling for updates` for the existing SQL config entry, then create the one-hour `homeassistant.update_entity` automation in `existing-sql-hourly-automation.yaml` using the verified entity ID. Do not enable that automation if its entity ID is not confirmed.
 3. Make an ordinary backup using your established process. No backup or configuration is modified by these files.
 4. On explicit approval, copy the directory `custom_components/ha_storage_monitor` to `/config/custom_components/ha_storage_monitor` using File editor / Samba or SSH. Do not merge any SI Grid Monitor branch. Installing custom integrations requires an **approved** HA restart to load code. Before approval, inspect the code but leave HA running.
-5. After approved restart: Settings > Devices & services > Add Integration > Home Assistant Storage Monitor. The flow creates only one instance; choose disk-low threshold and monitoring retention.
+5. After approved restart: Settings > Devices & services > Add Integration > Home Assistant Storage Monitor. The flow creates only one instance; choose disk-low threshold and monitoring retention. Leave **Enable bounded Recorder writer diagnostics** off for the first controlled installation. Size measurements, InfluxDB probing, disk monitoring, independent history, dashboard and alarms continue with this option off.
 6. In Settings > Dashboards, create a **NEW** dashboard named `Storage Monitor` with its own sidebar entry, and add its JavaScript module resource URL: `/ha_storage_monitor/storage-monitor-card.js`. Paste the one-view YAML from `lovelace-dashboard-example.yaml`, or add `custom:ha-storage-monitor-card` manually. Dashboard is admin-only by design because it contains filesystem and entity diagnostics.
 7. Confirm the measured `Recorder SQLite` main-file value versus original SQL reading, check `Recorder WAL` and `Recorder SHM` separately, check `/config` disk scope, ensure Influx size is either exact `InfluxDB add-on total` or visibly unavailable, and discover additional readable local SQLite database filenames.
 8. Read the `Growth & alarms` page: it will show `learning` for the first eight days. **Do not force-fill eight days of fake history.** Independent disk-low warnings can trigger immediately.
-9. Confirm the **six-hour** Recorder writer query remains within its four-second progress budget. If it times out, the window is recorded `unavailable` and no incomplete counts are presented as complete. Check HA logs and do not add indexes to production Recorder.
-10. Roll back by removing the Storage Monitor config entry and dashboard resource through HA UI. Any file deletion or HA restart should be separately approved. The original SQL sensor and production databases remain unchanged.
+9. Confirm the Top Writers view says **Recorder writer diagnostics disabled** and does not show zero rows. Follow [the controlled installation smoke test](CONTROLLED_INSTALL_SMOKE_TEST.md). Enabling writer diagnostics is a later, separate opt-in decision. The first partial interval after enabling is recorded unavailable without querying Recorder; collection begins only after a full post-opt-in local checkpoint interval.
+10. To stop writer queries after they have been enabled, turn the option off under Settings > Devices & Services > Storage Monitor > Configure. The config entry reloads and future writer queries stop; size/disk/Influx/history monitoring continues. Full rollback removes the Storage Monitor config entry and dashboard resource through HA UI. Any file deletion or HA restart requires separate approval. The original SQL sensor and production databases remain unchanged.
 
 ## Scope of generic local SQL file discovery
 
@@ -129,6 +129,11 @@ intervals. Prior-week comparison requires 32 consecutive verified intervals.
 A query timeout, missed HA shutdown checkpoint, or permission failure keeps
 comparisons in learning until a clean eight-day window exists. Entity row counts
 are not attributable physical bytes. No additional SQL sensor is created.
+
+Writer diagnostics are opt-in and default to disabled. Configuration changes
+reload the entry. Disabling immediately prevents future writer queries while
+all storage-size monitoring continues. Re-enabling starts a new consent period;
+an interval that began before that time is not queried or backfilled.
 
 **Operational caution:** The 4-second limit is a query progress budget, not
 a guarantee of zero memory/CPU impact. Test a single six-hour window on HA OS

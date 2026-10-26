@@ -3,6 +3,8 @@
 ## Safer Recorder top-writers design
 
 - Replaced the full eight-day Recorder state aggregation with a bounded read-only query for only the previous 6-hour local checkpoint interval.
+- Added `enable_recorder_writer_diagnostics`, default `false`. Disabled mode never opens Recorder for entity-writer diagnostics and remains explicit on the dashboard; hourly size, disk, InfluxDB, history and alarm functions continue.
+- Enabling is non-retroactive: an interval that began before opt-in is stored as unavailable without running the Recorder query. Disable/re-enable starts a new consent period, while an ordinary enabled reload preserves it.
 - Four local checkpoints per day at 00, 06, 12, 18 Europe/Ljubljana. Each interval is saved exactly once into the monitor's own SQLite store.
 - Read-only time index required; rows are streamed without SQL grouping or a temporary B-tree. A 4-second progress interruption plus hard limits of 500,000 rows, 5,000 entities and 256 KiB serialized counts fail closed. Failed intervals are unavailable, never partial.
 - Dashboard builds a local-day ranking from four saved intervals, and a previous-week baseline from the preceding 28 intervals. It does not query Recorder on page loads.
