@@ -5,19 +5,21 @@ This checklist is documentation only. Installation, file copying and the require
 ## Initial installation: writer diagnostics off
 
 1. Confirm an ordinary Home Assistant backup exists using the owner's established process.
-2. Copy only `custom_components/ha_storage_monitor` into the corresponding `/config/custom_components` directory after approval, then perform the separately approved Home Assistant restart.
-3. Add **Home Assistant Storage Monitor** from Settings > Devices & Services.
-4. Leave **Enable bounded Recorder writer diagnostics** off. It defaults to off.
-5. Add the dashboard resource/card only after the integration loads without errors.
-6. Verify the Top Writers view says **Recorder writer diagnostics disabled**. It must not show zero rows or a fabricated ranking.
-7. Verify the following continue independently:
+2. Install or update **Home Assistant Storage Monitor `0.1.2-beta.2`** through HACS (or copy only `custom_components/ha_storage_monitor` into the corresponding `/config/custom_components` directory). Downloading files does not activate new Python code.
+3. After separate owner approval, perform one controlled Home Assistant Core restart. A config-entry reload alone does not import upgraded custom-component Python.
+4. For a new installation, add **Home Assistant Storage Monitor** from Settings > Devices & Services. For an update, confirm the existing config entry and `.storage/ha_storage_monitor_history.sqlite3` remain in place; do not delete or recreate them.
+5. Leave **Enable bounded Recorder writer diagnostics** off. It defaults to off.
+6. Add or retain the dashboard resource/card only after the integration loads without errors.
+7. Verify the Top Writers view says **Recorder writer diagnostics disabled**. It must not show zero rows or a fabricated ranking.
+8. Verify Home Assistant logs do not contain `async_add_executor_job() got an unexpected keyword argument` or `Storage Monitor sample failed` during the startup sample.
+9. Verify the following continue independently:
    - Recorder main/WAL/SHM apparent sizes and their total;
    - `/config` disk total/free/used scope;
    - InfluxDB add-on total only when HA Core receives an authorized exact Supervisor subtree, otherwise `Unavailable`;
    - generic nonrecursive local SQLite discovery;
    - hourly history and growth state (`learning` until genuine history exists);
    - independent disk-low and stale-data status.
-8. Review Home Assistant logs for Storage Monitor exceptions. Do not add an index, install diagnostic tooling, change Recorder configuration, or restart again merely to force a result.
+10. Review the dashboard summary after the startup sample. Confirm existing history, alert acknowledgements and cooldown state were preserved. Do not add an index, install diagnostic tooling, change Recorder configuration, or restart again merely to force a result.
 
 ## Later optional writer-diagnostics opt-in
 
@@ -33,6 +35,8 @@ This is a separate decision after the disabled-mode smoke test succeeds.
 
 - Turn writer diagnostics off in Configure to stop all future Recorder writer queries. Size, disk, InfluxDB, independent history, dashboard and alarms remain active.
 - Previously saved writer summaries stay only in the monitor's own SQLite retention window but are not displayed as current while disabled.
+- An options change performs a config-entry reload. It does not require a restart and must not be used as evidence that newly downloaded integration Python was loaded.
+- To roll back integration code, use HACS to redownload the previously approved version, preserve the existing monitor SQLite, and activate that code only with a separately approved controlled Core restart.
 - Remove the Storage Monitor config entry and dashboard resource for functional rollback.
 - Removing integration files, deleting the monitor's own SQLite file, or restarting Home Assistant requires separate explicit approval.
 - Rollback never changes the existing Recorder SQL sensor or production Recorder, WAL/SHM, InfluxDB, SI Grid Monitor archives, retention or indexes.

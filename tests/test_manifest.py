@@ -12,6 +12,7 @@ def test_manifest_declares_runtime_components_used_during_setup():
     assert {"http", "websocket_api"}.issubset(manifest["dependencies"])
     assert manifest["config_flow"] is True
     assert manifest["requirements"] == []
+    assert manifest["version"] == "0.1.2-beta.2"
 
 
 def test_hacs_metadata_targets_supported_core_release():

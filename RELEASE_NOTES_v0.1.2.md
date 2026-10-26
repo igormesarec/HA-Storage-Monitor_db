@@ -1,4 +1,31 @@
-# Home Assistant Storage Monitor v0.1.2-beta.1
+# Home Assistant Storage Monitor v0.1.2-beta.2
+
+## HA OS runtime hotfix
+
+- Fixed all direct keyword-argument calls to HA Core's positional
+  `async_add_executor_job()` API by wrapping keyword-only database operations
+  in `functools.partial()`.
+- Covered `check_disk()`, `check_growth()`, `check_stale()` and dashboard
+  `summary()` with a strict executor stub and a source-level regression check.
+- Added offline startup-cycle tests with Recorder writer diagnostics disabled,
+  normal and low disk states, unavailable Supervisor InfluxDB data, six-hour
+  growth alerts, two-hour stale detection, persistent alert state and the
+  admin WebSocket summary.
+- Alert/cooldown state is now durable before persistent-notification delivery.
+  A notification service failure is logged without retrying once per hourly
+  sample inside the same six-hour cooldown window.
+- The schema and path of the monitor-owned SQLite are unchanged. Existing
+  snapshots, writer summaries, acknowledgements, cooldowns and configuration
+  remain in place. Recorder writer diagnostics remain disabled by default.
+
+### HACS update
+
+Download `0.1.2-beta.2` through HACS, then perform one separately approved,
+controlled Home Assistant Core restart to import the upgraded Python. A config
+entry reload is sufficient for option changes but not for activating downloaded
+custom-component code. Keep Recorder writer diagnostics off for the first
+controlled smoke test. Do not delete
+`.storage/ha_storage_monitor_history.sqlite3` during update or rollback.
 
 ## Safer Recorder top-writers design
 
@@ -18,6 +45,6 @@
 
 ## Deployment status
 
-Offline tests only. Not installed in Home Assistant. No HA restart or production database changes. The verified Terminal & SSH Supervisor InfluxDB add-on total was 7,287,276,210 bytes on 2026-10-25, but access from HA Core remains to be verified.
+The beta.2 hotfix has offline tests only. A controlled beta.1 HA Core 2026.10.4 test confirmed the executor-call failure and left production data untouched. Beta.2 has not been installed or restarted in Home Assistant, and no production database changes were made. The verified Terminal & SSH Supervisor InfluxDB add-on total was 7,287,276,210 bytes on 2026-10-25, but access from HA Core remains to be verified.
 
 The live Recorder performance probe remains unexecuted. A current `core-ssh` check on 2026-10-26 found no `sqlite3` executable (`command -v` returned nothing and `/usr/bin/sqlite3` was absent), so the attempted commands exited before opening Recorder. Installing diagnostic tooling requires separate owner approval.
