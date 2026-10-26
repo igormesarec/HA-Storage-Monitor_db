@@ -16,7 +16,7 @@ from .const import DOMAIN, DEFAULT_INFLUX_SLUG, ALARM_HOURS, GROWTH_SOURCES
 from .engine import Sample, SnapshotDB, evaluate, utc_hour, allow_notification, allowed_acknowledgement_sources, DAY, HOUR
 from .sources import collect_local
 from .supervisor import get_influx_usage
-from .writers import top_writers
+from .writers import collect_writer_window, local_checkpoint_window, summarize_writer_windows
 
 _LOGGER = logging.getLogger(__name__)
 TZ = ZoneInfo("Europe/Ljubljana")
@@ -100,14 +100,16 @@ class StorageMonitor:
                            detail="Previously monitored database missing") if s.source=="database_total" else s for s in samples]
             await self.hass.async_add_executor_job(self.db.save,samples)
             if check:
-                diagnostic=await self.hass.async_add_executor_job(
-                    top_writers,self.hass.config.path("home-assistant_v2.db"),now)
-                if diagnostic["status"]=="ok":
-                    registry=er.async_get(self.hass)
-                    for item in diagnostic["entities"]:
-                        reg=registry.async_get(item["entity_id"])
-                        item["integration"]=reg.platform if reg else "unknown"
-                await self.hass.async_add_executor_job(self.db.save_writers,hour,diagnostic)
+                # Four bounded LOCAL checkpoint windows per day. Each queries
+                # only the interval since the preceding checkpoint, never
+                # eight days of Recorder. Durable idempotence across restarts.
+                start_ts, end_ts = local_checkpoint_window(local_now)
+                already = await self.hass.async_add_executor_job(self.db.writer_window_exists, end_ts)
+                if not already:
+                    diagnostic = await self.hass.async_add_executor_job(
+                        collect_writer_window, self.hass.config.path("home-assistant_v2.db"),
+                        start_ts, end_ts)
+                    await self.hass.async_add_executor_job(self.db.save_writer_window, diagnostic)
                 await self.check_growth(hour,local_now)
             await self.check_disk(samples,hour,local_now)
             await self.check_stale(samples,hour,local_now)
@@ -115,6 +117,7 @@ class StorageMonitor:
             if local_now.hour==3 and check is False:
                 retain=int(self.options.get("retention_days",365))
                 await self.hass.async_add_executor_job(self.db.compact_retention,hour-retain*DAY)
+                await self.hass.async_add_executor_job(self.db.prune_writer_windows,hour-9*DAY)
         except Exception:
             _LOGGER.exception("Storage Monitor sample failed; production data untouched")
         finally:
@@ -126,10 +129,13 @@ class StorageMonitor:
         keys.extend(x["source"] for x in latest if x["source"].startswith("database:"))
         window=f"{local_now.date().isoformat()}:{(local_now.hour//6)*6:02d}"
         for key in keys:
-            hist=await self.hass.async_add_executor_job(self.db.history,key,hour-8*DAY,2200)
-            ev=evaluate(key,hist,hour,
+            evidence=await self.hass.async_add_executor_job(
+                self.db.growth_evidence,key,hour,hourly_source=key!="influx_addon")
+            ev=evaluate(key,evidence["points"],hour,
                 min_excess_bytes=int(self.options.get("min_excess_mib",0))*1024*1024,
-                cadence_hours=6 if key=="influx_addon" else 1)
+                cadence_hours=6,
+                observed_shrink=evidence["observed_shrink"],
+                hourly_coverage_ok=evidence["hourly_coverage_ok"])
             previous=await self.hass.async_add_executor_job(self.db.get_alert,key)
             if ev.status=="alarm":
                 permitted=allow_notification(previous,window,hour)
@@ -202,6 +208,10 @@ class StorageMonitor:
 
     async def summary(self):
         now=utc_hour(int(time.time()))
+        local_now = datetime.fromtimestamp(now,TZ)
+        checkpoint_local = local_now.replace(hour=(local_now.hour//6)*6,
+                                             minute=0,second=0,microsecond=0)
+        checkpoint_end = int(checkpoint_local.timestamp())
         items=await self.hass.async_add_executor_job(self.db.latest)
         keys=[s["source"] for s in items]
         alerts={}
@@ -209,8 +219,11 @@ class StorageMonitor:
         for key in keys:
             alerts[key]=await self.hass.async_add_executor_job(self.db.get_alert,key)
             if key in GROWTH_SOURCES or key.startswith("database:"):
-                hist=await self.hass.async_add_executor_job(self.db.history,key,now-8*DAY,2200)
-                growth[key]=evaluate(key,hist,now,cadence_hours=6 if key=="influx_addon" else 1).as_json()
+                evidence=await self.hass.async_add_executor_job(
+                    self.db.growth_evidence,key,checkpoint_end,hourly_source=key!="influx_addon")
+                growth[key]=evaluate(key,evidence["points"],checkpoint_end,cadence_hours=6,
+                    observed_shrink=evidence["observed_shrink"],
+                    hourly_coverage_ok=evidence["hourly_coverage_ok"]).as_json()
         alerts["disk_low"]=await self.hass.async_add_executor_job(self.db.get_alert,"disk_low")
         for key in keys:
             alerts["stale:"+key]=await self.hass.async_add_executor_job(self.db.get_alert,"stale:"+key)
@@ -225,15 +238,25 @@ class StorageMonitor:
                 older=samples_by_hour.get(now-delta*HOUR)
                 changes[key]["delta"+str(delta)+"h"] = (
                     current["size"]-older["size"] if current and older else None)
-        writers=await self.hass.async_add_executor_job(self.db.latest_writers)
-        grouped={}
+        # Summarize at most 32 locally saved six-hour intervals, NOT Recorder.
+        window_rows = await self.hass.async_add_executor_job(
+            self.db.writer_window_history,checkpoint_end-9*DAY,checkpoint_end)
+        writers = summarize_writer_windows(window_rows,checkpoint_end)
+        registry = er.async_get(self.hass)
+        grouped = {}
         for item in writers.get("entities",[]):
-            platform=item.get("integration") or "unknown"
-            group=grouped.setdefault(platform,{"integration":platform,"rows_1h":0,"rows_24h":0,"entities_in_top20":0})
-            group["rows_1h"]+=int(item.get("rows_1h",0))
-            group["rows_24h"]+=int(item.get("rows_24h",0))
-            group["entities_in_top20"]+=1
-        writers["top20_grouped_by_integration"]=sorted(grouped.values(),key=lambda r:-r["rows_24h"])
+            reg=registry.async_get(item["entity_id"])
+            platform=reg.platform if reg else "unknown"
+            item["integration"]=platform
+            group=grouped.setdefault(platform,{"integration":platform,
+                "rows_6h":0,"rows_24h":0 if writers["last24_complete"] else None,
+                "entities_in_top20":0})
+            group["rows_6h"] += int(item.get("rows_6h") or 0)
+            if writers["last24_complete"]:
+                group["rows_24h"] += int(item.get("rows_24h") or 0)
+            group["entities_in_top20"] += 1
+        writers["top20_grouped_by_integration"]=sorted(
+            grouped.values(),key=lambda r:-(r["rows_24h"] if r["rows_24h"] is not None else r["rows_6h"]))
         return {"samples":items,"alerts":alerts,"growth":growth,"writers":writers,
                 "now":int(time.time()),"timezone":"Europe/Ljubljana","changes":changes,
                 "baseline":"24h size change compared with average DAILY growth of preceding seven days; strictly >5%",
