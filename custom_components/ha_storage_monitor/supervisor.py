@@ -17,15 +17,22 @@ def extract_addon_usage(payload: dict, slug: str) -> SupervisorUsage:
         return SupervisorUsage(None,"unavailable","Supervisor response has no structured disk data")
     if payload.get("result","ok")!="ok":
         return SupervisorUsage(None,"unavailable","Supervisor returned non-ok result")
-    addons = next((x for x in data.get("children",[]) if x.get("id") in ("addons_data","apps_data")),None)
+    children = data.get("children")
+    if not isinstance(children,list):
+        return SupervisorUsage(None,"unavailable","Supervisor disk children missing or malformed")
+    addons = next((x for x in children if isinstance(x,dict) and
+                   x.get("id") in ("addons_data","apps_data")),None)
     if not addons:
         return SupervisorUsage(None,"unavailable","apps_data/addons_data breakdown missing; depth/permissions may be insufficient")
-    matching = [node for node in addons.get("children",[]) if
+    addon_children = addons.get("children")
+    if not isinstance(addon_children,list):
+        return SupervisorUsage(None,"unavailable","Per-add-on disk breakdown missing or malformed")
+    matching = [node for node in addon_children if isinstance(node,dict) and
                 str(node.get("id","")).split("/")[-1]==slug]
     if len(matching)!=1:
         return SupervisorUsage(None,"unavailable",f"Exact add-on {slug} not present in Supervisor breakdown")
     val=matching[0].get("used_bytes")
-    if not isinstance(val,int) or val<0:
+    if type(val) is not int or val<0:
         return SupervisorUsage(None,"unavailable","No numeric used_bytes for add-on")
     return SupervisorUsage(val,"ok","Supervisor addons_data per-add-on total; not engine-only")
 

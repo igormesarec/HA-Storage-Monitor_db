@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp-*/
 .venv/
 venv/
 .env
@@ -16,6 +17,7 @@ venv/
 *.sqlite3-shm
 *.tar
 *.tar.gz
+*.zip
 *.backup
 *.bak
 secrets.yaml

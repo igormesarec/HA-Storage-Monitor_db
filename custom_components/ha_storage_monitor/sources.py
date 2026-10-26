@@ -1,7 +1,7 @@
 """Read-only local file probes. Never open monitored DBs for writing."""
 from __future__ import annotations
 from pathlib import Path
-import os
+import shutil
 from .engine import Sample
 
 
@@ -40,17 +40,16 @@ def collect_local(config_dir: str, hour: int, now: int) -> list[Sample]:
                             detail="component unavailable"))
     try:
         # The /config mount may be the HA OS data disk, but scope is explicit.
-        f = os.statvfs(config_dir)
-        block = f.f_frsize
-        total = f.f_blocks*block
-        free = f.f_bavail*block
-        items.extend((Sample(hour,"disk_total",total,"ok","config_mount_statvfs",now),
-                      Sample(hour,"disk_free",free,"ok","config_mount_statvfs",now),
-                      Sample(hour,"disk_used",total-f.f_bfree*block,"ok","config_mount_statvfs",now)))
+        usage = shutil.disk_usage(config_dir)
+        total = usage.total
+        free = usage.free
+        items.extend((Sample(hour,"disk_total",total,"ok","config_path_disk_usage",now),
+                      Sample(hour,"disk_free",free,"ok","config_path_disk_usage",now),
+                      Sample(hour,"disk_used",usage.used,"ok","config_path_disk_usage",now)))
     except OSError as err:
-        items.extend((Sample(hour,"disk_total",None,"unavailable","config_mount_statvfs",None,detail=type(err).__name__),
-                      Sample(hour,"disk_free",None,"unavailable","config_mount_statvfs",None,detail=type(err).__name__),
-                      Sample(hour,"disk_used",None,"unavailable","config_mount_statvfs",None,detail=type(err).__name__)))
+        items.extend((Sample(hour,"disk_total",None,"unavailable","config_path_disk_usage",None,detail=type(err).__name__),
+                      Sample(hour,"disk_free",None,"unavailable","config_path_disk_usage",None,detail=type(err).__name__),
+                      Sample(hour,"disk_used",None,"unavailable","config_path_disk_usage",None,detail=type(err).__name__)))
     # Inspect only two authorized, non-recursive directories. Protected add-on
     # filesystems are *not* accessible here. Never follow symlink directories.
     # Exclude Recorder and our own snapshot database to avoid double-counting
