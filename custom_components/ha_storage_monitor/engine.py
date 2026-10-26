@@ -256,6 +256,13 @@ def allowed_acknowledgement_sources(sources: Iterable[str]) -> set[str]:
     return observed | {"disk_low"} | {"stale:" + source for source in observed}
 
 
+def disk_low_evidence(free_bytes: int | None, recorder_bytes: int | None,
+                      configured_bytes: int) -> tuple[bool | None, int]:
+    """Return an independent disk alarm decision and its effective threshold."""
+    threshold = max(max(0, int(configured_bytes)), max(0, int(recorder_bytes or 0)))
+    return (None if free_bytes is None else int(free_bytes) < threshold), threshold
+
+
 def evaluate(source: str, samples: list[dict], now: int, *, min_excess_bytes: int = 0,
              cadence_hours: int = 1, observed_shrink: bool = False,
              hourly_coverage_ok: bool = True) -> Evaluation:

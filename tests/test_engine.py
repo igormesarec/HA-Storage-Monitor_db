@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from ha_storage_monitor.engine import Sample, SnapshotDB, evaluate, allow_notification, allowed_acknowledgement_sources, HOUR, DAY, utc_hour
+from ha_storage_monitor.engine import Sample, SnapshotDB, evaluate, allow_notification, allowed_acknowledgement_sources, disk_low_evidence, HOUR, DAY, utc_hour
 
 MiB=1024**2
 T=10_000*HOUR
@@ -174,3 +174,12 @@ def test_acknowledgment_keys_include_stale_for_observed_sources_only(tmp_path):
     state=db.get_alert('stale:influx_addon')
     assert not allow_notification(state,'2026-10-25:06',T+HOUR)
     assert allow_notification(state,'2026-10-26:06',T+25*HOUR)
+
+
+def test_disk_low_alarm_is_independent_of_growth_learning():
+    gib=1024**3
+    low,threshold=disk_low_evidence(14*gib,5*gib,15*gib)
+    assert low is True and threshold==15*gib
+    low,threshold=disk_low_evidence(7*gib,8*gib,5*gib)
+    assert low is True and threshold==8*gib
+    assert disk_low_evidence(None,8*gib,15*gib)[0] is None

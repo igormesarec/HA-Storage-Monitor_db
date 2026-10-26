@@ -13,7 +13,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers import entity_registry as er
 from .const import DOMAIN, DEFAULT_INFLUX_SLUG, ALARM_HOURS, GROWTH_SOURCES
-from .engine import Sample, SnapshotDB, evaluate, utc_hour, allow_notification, allowed_acknowledgement_sources, DAY, HOUR
+from .engine import Sample, SnapshotDB, evaluate, utc_hour, allow_notification, allowed_acknowledgement_sources, disk_low_evidence, DAY, HOUR
 from .sources import collect_local
 from .supervisor import get_influx_usage
 from .writers import collect_writer_window, local_checkpoint_window, summarize_writer_windows
@@ -39,6 +39,7 @@ class StorageMonitor:
         self.db=SnapshotDB(hass.config.path(".storage","ha_storage_monitor_history.sqlite3"))
         self.unsub=None
         self._running=False
+        self._pending_check=False
         self.cache_influx: Sample | None=None
         self.last_influx_probe: int | None=None
         self._last_disk_low=False
@@ -48,16 +49,25 @@ class StorageMonitor:
         await self.hass.async_add_executor_job(self.db.initialize)
         self.unsub = async_track_time_change(self.hass,self._hourly,minute=0,second=10)
         # Cold start updates current measurements without firing historical growth alerts.
-        self.hass.async_create_background_task(self.sample(False),"Storage Monitor startup")
+        self.entry.async_create_background_task(
+            self.hass,self.sample(False),"Storage Monitor startup")
 
     @callback
     def _hourly(self, now: datetime):
         local = now.astimezone(TZ)
-        self.hass.async_create_background_task(self.sample(local.hour in ALARM_HOURS and local.minute==0),
-                                                "Storage Monitor hourly sample")
+        # The scheduler itself is pinned to minute 00. If the event loop runs
+        # this callback late within the same hour, do not silently lose a
+        # 00/06/12/18 checkpoint merely because ``local.minute`` is nonzero.
+        self.entry.async_create_background_task(
+            self.hass,self.sample(local.hour in ALARM_HOURS),
+            "Storage Monitor hourly sample")
 
     async def sample(self, check: bool):
         if self._running:
+            # A cold-start sample can overlap the first scheduled checkpoint.
+            # Queue that checkpoint instead of dropping it; the immutable
+            # writer-window key still prevents duplicate Recorder reads.
+            self._pending_check = self._pending_check or check
             return
         self._running=True
         try:
@@ -122,6 +132,11 @@ class StorageMonitor:
             _LOGGER.exception("Storage Monitor sample failed; production data untouched")
         finally:
             self._running=False
+            if self._pending_check:
+                self._pending_check=False
+                self.entry.async_create_background_task(
+                    self.hass,self.sample(True),
+                    "Storage Monitor deferred checkpoint")
 
     async def check_growth(self,hour: int,local_now: datetime):
         keys=["recorder_total","influx_addon"]
@@ -159,8 +174,9 @@ class StorageMonitor:
         recorder=sizes.get("recorder_total")
         if free is None:
             return
-        threshold=max(int(self.options.get("low_disk_gib",15))*1024**3,recorder or 0)
-        is_low=free<threshold
+        is_low,threshold=disk_low_evidence(
+            free,recorder,int(self.options.get("low_disk_gib",15))*1024**3)
+        assert is_low is not None
         prev=await self.hass.async_add_executor_job(self.db.get_alert,"disk_low")
         window=f"{local_now.date().isoformat()}:{(local_now.hour//6)*6:02d}"
         notify=is_low and allow_notification(prev,window,hour) and (not prev["active"] or
