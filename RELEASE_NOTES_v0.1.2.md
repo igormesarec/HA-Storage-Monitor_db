@@ -17,3 +17,5 @@
 ## Deployment status
 
 Offline tests only. Not installed in Home Assistant. No HA restart or production database changes. The verified Terminal & SSH Supervisor InfluxDB add-on total was 7,287,276,210 bytes on 2026-10-25, but access from HA Core remains to be verified.
+
+The live Recorder performance probe remains unexecuted. A current `core-ssh` check on 2026-10-26 found no `sqlite3` executable (`command -v` returned nothing and `/usr/bin/sqlite3` was absent), so the attempted commands exited before opening Recorder. Installing diagnostic tooling requires separate owner approval.
