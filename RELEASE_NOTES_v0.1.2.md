@@ -1,4 +1,24 @@
-# Home Assistant Storage Monitor v0.1.2-beta.2
+# Home Assistant Storage Monitor v0.1.2-beta.3
+
+## Lovelace frontend initialization hotfix
+
+- Replaced the component's constructor-time `this.lang` assignment with the
+  non-reflected internal property `this._language` throughout the card.
+- Audited the remaining constructor writes. They are component-owned state;
+  `attachShadow()` is permitted and the constructor now creates no attributes.
+- Preserved English/Slovenian switching, all four tabs, measurements, history,
+  alarms, writer status and dashboard interactions.
+- Added a jsdom regression that loads the shipped resource, registers the
+  custom element, calls
+  `document.createElement('ha-storage-monitor-card')`, verifies `setConfig`,
+  assigns `hass`, renders WebSocket results, changes language and tests
+  disconnected/reconnected timer lifecycle.
+- CI now runs this DOM test in addition to `node --check`; syntax checking alone
+  cannot detect browser custom-element construction failures.
+
+Beta.3 changes only the frontend state property, test tooling, version metadata
+and documentation. Recorder diagnostics, sampling, alarms, history storage and
+all production data boundaries are unchanged.
 
 ## HA OS runtime hotfix
 
@@ -20,8 +40,9 @@
 
 ### HACS update
 
-Download `0.1.2-beta.2` through HACS, then perform one separately approved,
-controlled Home Assistant Core restart to import the upgraded Python. A config
+Download `0.1.2-beta.3` through HACS, then perform one separately approved,
+controlled Home Assistant Core restart to load the upgraded integration and
+static resource. A config
 entry reload is sufficient for option changes but not for activating downloaded
 custom-component code. Keep Recorder writer diagnostics off for the first
 controlled smoke test. Do not delete
@@ -45,6 +66,6 @@ controlled smoke test. Do not delete
 
 ## Deployment status
 
-The beta.2 hotfix has offline tests only. A controlled beta.1 HA Core 2026.10.4 test confirmed the executor-call failure and left production data untouched. Beta.2 has not been installed or restarted in Home Assistant, and no production database changes were made. The verified Terminal & SSH Supervisor InfluxDB add-on total was 7,287,276,210 bytes on 2026-10-25, but access from HA Core remains to be verified.
+The beta.3 frontend hotfix has offline DOM tests only. Controlled HA OS 2026.10.4 testing confirmed the beta.1 executor failure and beta.2 custom-element construction failure while leaving production data untouched. Beta.3 has not been installed or restarted in Home Assistant, and no production database changes were made. The verified Terminal & SSH Supervisor InfluxDB add-on total was 7,287,276,210 bytes on 2026-10-25, but access from HA Core remains to be verified.
 
 The live Recorder performance probe remains unexecuted. A current `core-ssh` check on 2026-10-26 found no `sqlite3` executable (`command -v` returned nothing and `/usr/bin/sqlite3` was absent), so the attempted commands exited before opening Recorder. Installing diagnostic tooling requires separate owner approval.

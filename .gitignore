@@ -5,6 +5,7 @@ __pycache__/
 .pytest-tmp-*/
 .venv/
 venv/
+node_modules/
 .env
 .env.*
 # Live Home Assistant data and secrets: NEVER commit

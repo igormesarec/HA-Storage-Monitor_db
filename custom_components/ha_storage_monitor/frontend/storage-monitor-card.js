@@ -5,11 +5,11 @@ class HAStorageMonitorCard extends HTMLElement {
     super();
     this.attachShadow({ mode: 'open' });
     this.tab = 'overview'; this.days = 7; this.selected = 'recorder_total';
-    this.lang = 'en'; this.data = null; this.points = [];
+    this._language = 'en'; this.data = null; this.points = [];
   }
   setConfig(config) {
     this.config = config || {};
-    this.lang = config.language === 'sl' ? 'sl' : 'en';
+    this._language = config.language === 'sl' ? 'sl' : 'en';
   }
   set hass(hass) {
     this._hass = hass;
@@ -18,7 +18,7 @@ class HAStorageMonitorCard extends HTMLElement {
   connectedCallback() { this.timer = setInterval(() => { if (this._hass) this.reload(); }, 300000); }
   disconnectedCallback() { if (this.timer) clearInterval(this.timer); }
   getCardSize() { return 7; }
-  t(en, sl) { return this.lang === 'sl' ? sl : en; }
+  t(en, sl) { return this._language === 'sl' ? sl : en; }
   esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   size(bytes) {
     if (bytes === null || bytes === undefined || Number.isNaN(Number(bytes))) return this.t('Unavailable','Ni na voljo');
@@ -28,7 +28,7 @@ class HAStorageMonitorCard extends HTMLElement {
     return (n/divisor).toFixed(unit==='B'?0:2) + ' ' + unit;
   }
   signed(bytes) { return bytes==null?'n/a':(bytes>=0?'+':'-')+this.size(Math.abs(bytes)); }
-  when(epoch) { return epoch ? new Date(epoch*1000).toLocaleString(this.lang==='sl'?'sl-SI':'en-GB'):'n/a'; }
+  when(epoch) { return epoch ? new Date(epoch*1000).toLocaleString(this._language==='sl'?'sl-SI':'en-GB'):'n/a'; }
   async reload() {
     try {
       this.data = await this._hass.callWS({type:'ha_storage_monitor/summary'});
@@ -81,7 +81,7 @@ class HAStorageMonitorCard extends HTMLElement {
       await this.reload();
     });
     const refresh=this.shadowRoot.querySelector('#refresh');if(refresh)refresh.onclick=()=>this.reload();
-    const lang=this.shadowRoot.querySelector('#lang');if(lang)lang.onchange=e=>{this.lang=e.target.value;this.render();};
+    const lang=this.shadowRoot.querySelector('#lang');if(lang)lang.onchange=e=>{this._language=e.target.value;this.render();};
   }
   samples(){return Object.fromEntries((this.data?.samples||[]).map(x=>[x.source,x]));}
   label(key){
@@ -168,7 +168,7 @@ class HAStorageMonitorCard extends HTMLElement {
   }
   settings(){const writerState=this.data?.writer_diagnostics_enabled?this.t('Enabled (bounded six-hour reads)','Omogočeno (omejene šesturne poizvedbe)'):this.t('Disabled (Recorder is not queried)','Izklopljeno (Recorder se ne poizveduje)');return `<div class="help">${this.t('Read-only monitoring. The optional InfluxDB figure is valid only when the Supervisor returns an exact add-on subtree. Hourly snapshots are stored in a separate SQLite database under /config/.storage. To change thresholds: Settings → Devices & Services → Storage Monitor → Configure.','Spremljanje samo za branje. Meritve se shranjujejo v ločeno bazo /config/.storage. Pragove spremenite v Nastavitvah integracije.')}</div>
     <p><strong>${this.t('Recorder writer diagnostics','Diagnostika zapisovalcev Recorderja')}:</strong> ${writerState}</p>
-    <label>${this.t('Dashboard language','Jezik')}: <select id="lang"><option value="en" ${this.lang==='en'?'selected':''}>English</option><option value="sl" ${this.lang==='sl'?'selected':''}>Slovenščina</option></select></label>
+    <label>${this.t('Dashboard language','Jezik')}: <select id="lang"><option value="en" ${this._language==='en'?'selected':''}>English</option><option value="sl" ${this._language==='sl'?'selected':''}>Slovenščina</option></select></label>
     <p class="muted">${this.t('This monitor never purges, vacuums or edits Home Assistant Recorder, WAL/SHM, InfluxDB, or any monitored SQL database files. The monitoring history database is independent. It does not modify PR #19.','Ta nadzornik ne briše ali spreminja produkcijskih baz, WAL/SHM ali drugih spremljanih podatkovnih baz.')}</p>`;}
 }
 customElements.define('ha-storage-monitor-card', HAStorageMonitorCard);
