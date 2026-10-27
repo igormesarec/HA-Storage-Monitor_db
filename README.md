@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.1.2-beta.3` (26 October 2026)
+**Independent prototype:** `0.2.0-beta.1` (27 October 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -18,7 +18,7 @@
 - `sources.py`: Recorder main + WAL + SHM apparent/allocated file bytes, bounded generic SQLite file discovery (`*.db`, `*.sqlite`, `*.sqlite3`) in `/config` and `/config/.storage` at directory depth one, additional local SQLite files aggregated separately; excludes Recorder and the monitor snapshot database, HA `/config` filesystem capacity.
 - `supervisor.py`: 6-hour interval Supervisor `GET /host/disks/default/usage?max_depth=2` for specific `a0d7b954_influxdb` subtree. Returns `unavailable`, **not zero**, without exact authorized size. Accepts `apps_data` and `addons_data` Supervisor IDs. This may represent other components in the same InfluxDB add-on, not solely TSM shard files.
 - `writers.py`: optional bounded Recorder diagnostics, **disabled by default**. While disabled, Recorder is never opened for entity-writer queries and the dashboard reports `Recorder writer diagnostics disabled`, not zero rows. When explicitly enabled, one read-only query runs per local six-hour checkpoint with the existing timestamp index guard, 4-second progress budget, 500,000-row/5,000-entity/256-KiB payload caps, and compact counts stored in our own SQLite. The query streams indexed rows without SQL `GROUP BY` or a temporary grouping B-tree. No missed or pre-opt-in interval is queried retroactively.
-- `frontend/storage-monitor-card.js`: responsive light/dark HA dashboard with Overview, Growth & Alarms, Top Writers, Settings / Access; real sampled history 1/7/30/90 days; language switch EN/SL; manual refresh; no cloud dependencies.
+- `frontend/storage-monitor-card.js`: responsive seven-tab light/dark HA dashboard: Overview, Databases, Charts, Top Writers, Disk Usage, Alerts and Settings; real sampled history for 1/7/30/90 days; English/Slovenian switching; no cloud dependencies.
 - `tests/`: offline, deterministic Python tests. These are **not** a replacement for HA OS integration tests.
 
 ### What the strict 5% alarm means
