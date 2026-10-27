@@ -61,7 +61,7 @@ test('card constructs through the Custom Elements registry and survives lifecycl
 
   card.setConfig({ language: 'sl', sql_entity: 'sensor.existing_size' });
   assert.equal(card._language, 'sl');
-  assert.equal(card.config.sql_entity, 'sensor.existing_size');
+  assert.equal(card._config.sql_entity, 'sensor.existing_size');
   assert.equal(card.hasAttribute('lang'), false);
 
   const websocketCalls = [];
@@ -75,24 +75,24 @@ test('card constructs through the Custom Elements registry and survives lifecycl
     },
   };
   await card.reload();
-  assert.equal(card.started, true);
+  assert.equal(card._started, true);
   assert.ok(websocketCalls.some(call => call.type === 'ha_storage_monitor/summary'));
   assert.ok(websocketCalls.some(call => call.type === 'ha_storage_monitor/history'));
   assert.match(card.shadowRoot.textContent, /Nadzor prostora podatkovnih baz/);
   assert.match(card.shadowRoot.textContent, /20\.00 GiB/);
   const tabs = [...card.shadowRoot.querySelectorAll('[data-tab]')];
   assert.deepEqual(tabs.map(tab => tab.dataset.tab), [
-    'overview', 'growth', 'writers', 'settings',
+    'overview', 'databases', 'charts', 'writers', 'disk', 'alerts', 'settings',
   ]);
   tabs[1].click();
-  assert.equal(card.tab, 'growth');
+  assert.equal(card._tab, 'databases');
 
   window.document.body.append(card);
   assert.deepEqual(intervals.map(item => item.milliseconds), [300_000]);
 
-  card.tab = 'settings';
+  card._tab = 'settings';
   card.render();
-  const languageSelect = card.shadowRoot.querySelector('#lang');
+  const languageSelect = card.shadowRoot.querySelector('#language');
   assert.ok(languageSelect);
   languageSelect.value = 'en';
   languageSelect.dispatchEvent(new window.Event('change'));

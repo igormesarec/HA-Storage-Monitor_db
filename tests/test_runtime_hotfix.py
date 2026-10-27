@@ -190,6 +190,13 @@ def test_startup_writer_off_normal_disk_unavailable_influx_and_summary(
     assert monitor.db.get_alert("disk_low")["active"] == 0
     assert not hass.notification_calls
     assert summary["writers"]["reason"] == "Recorder writer diagnostics disabled"
+    assert summary["effective_options"] == {
+        "low_disk_gib": 15,
+        "min_excess_mib": 0,
+        "retention_days": 365,
+        "repeat_notifications": False,
+        "enable_recorder_writer_diagnostics": False,
+    }
     assert connection.results[0][0] == 7
     assert connection.results[0][1]["writer_diagnostics_enabled"] is False
     assert not connection.errors

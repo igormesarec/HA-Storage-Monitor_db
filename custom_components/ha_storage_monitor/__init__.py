@@ -322,6 +322,13 @@ class StorageMonitor:
         return {"samples":items,"alerts":alerts,"growth":growth,"writers":writers,
                 "now":int(time.time()),"timezone":"Europe/Ljubljana","changes":changes,
                 "writer_diagnostics_enabled":self.writer_diagnostics_enabled,
+                "effective_options":{
+                    "low_disk_gib":int(self.options["low_disk_gib"]),
+                    "min_excess_mib":int(self.options["min_excess_mib"]),
+                    "retention_days":int(self.options["retention_days"]),
+                    "repeat_notifications":bool(self.options["repeat_notifications"]),
+                    "enable_recorder_writer_diagnostics":self.writer_diagnostics_enabled,
+                },
                 "baseline":"24h size change compared with average DAILY growth of preceding seven days; strictly >5%",
                 "scope":"Filesystem file stat reports apparent bytes, disk usage is scoped to /config path, Supervisor is add-on total"}
 
