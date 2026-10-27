@@ -194,3 +194,18 @@ def test_writer_diagnostics_state_survives_reload_and_resets_after_disable(tmp_p
     assert db.configure_writer_diagnostics(False,400) is None
     # Re-enabling after an explicit disable starts a new non-retroactive run.
     assert db.configure_writer_diagnostics(True,500)==500
+
+
+def test_influx_probe_attempt_and_success_survive_restart(tmp_path):
+    path=tmp_path/'own.sqlite3';db=SnapshotDB(path);db.initialize()
+    assert db.reserve_influx_probe(T)
+    assert not SnapshotDB(path).reserve_influx_probe(T+HOUR)
+    sample=Sample(T,'influx_addon',12345,'ok','supervisor_addons_data_total',T+17,
+                  detail='verified add-on total')
+    db.save_influx_success(sample)
+    state=SnapshotDB(path).influx_probe_state()
+    assert state['last_attempt_at']==T
+    assert state['last_success']['size']==12345
+    assert state['last_success']['measured_at']==T+17
+    assert state['last_success']['detail']=='verified add-on total'
+    assert SnapshotDB(path).reserve_influx_probe(T+6*HOUR)

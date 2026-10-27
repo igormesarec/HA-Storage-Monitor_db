@@ -1,6 +1,8 @@
 # Copy into a NEW dedicated Lovelace dashboard (YAML mode).
 # Add resource URL: /ha_storage_monitor/storage-monitor-card.js (JavaScript Module)
-# This card contains Overview, Growth & Alarms, Top Writers, Settings tabs.
+# This card contains all seven Storage Monitor tabs.
+# Optional: set sql_entity to the verified existing Recorder size sensor.
+# Set show_sql_cross_check: false to hide that read-only comparison.
 title: Storage Monitor
 views:
   - title: Storage Monitor
@@ -9,3 +11,4 @@ views:
     cards:
       - type: custom:ha-storage-monitor-card
         language: en
+        sql_entity: sensor.ha_recorder_database_size

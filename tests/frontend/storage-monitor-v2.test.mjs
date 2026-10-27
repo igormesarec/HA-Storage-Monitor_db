@@ -189,13 +189,52 @@ test('growth alarms expose durable 24-hour and seven-day acknowledgments',async(
 test('enabled writer data and language switching remain functional',()=>{
   const enabled=summary({
     writer_diagnostics_enabled:true,
-    writers:{status:'learning',intervals_verified:1,intervals_required:32,entities:[{entity_id:'sensor.test',integration:'demo',rows_6h:12,rows_24h:null,share_percent:50}],top20_grouped_by_integration:[{integration:'demo',rows_6h:12,rows_24h:null,entities_in_top20:1}]},
+    writers:{status:'ok',intervals_verified:32,intervals_required:32,entities:[{entity_id:'sensor.test',integration:'demo',rows_6h:12,rows_24h:48,share_percent:50,rate_per_min:.033,previous7_daily:24,ratio:2,high_writer:true}],top20_grouped_by_integration:[{integration:'demo',rows_6h:12,rows_24h:48,entities_in_top20:1}]},
     effective_options:{...summary().effective_options,enable_recorder_writer_diagnostics:true},
   });
   const {dom,card}=cardWith(enabled);
-  card._tab='writers'; card.render(); assert.match(card.shadowRoot.textContent,/sensor\.test/);
+  card._tab='writers'; card.render();
+  assert.match(card.shadowRoot.textContent,/sensor\.test/);
+  assert.match(card.shadowRoot.textContent,/Partial integration totals derived from Top 20 entities/);
+  assert.match(card.shadowRoot.textContent,/Records\/min/);
+  assert.match(card.shadowRoot.textContent,/Prior 7d daily avg/);
+  assert.match(card.shadowRoot.textContent,/2×/);
+  assert.match(card.shadowRoot.textContent,/Warning/);
+  card._data.writers.entities[0]={entity_id:'sensor.learning',integration:'demo',rows_6h:3,rows_24h:null,share_percent:null,rate_per_min:null,previous7_daily:null,ratio:null,high_writer:false};
+  card.render();
+  assert.match(card.shadowRoot.textContent,/sensor\.learning/);
+  assert.match(card.shadowRoot.textContent,/Learning/);
   card._tab='settings'; card.render(); const select=card.shadowRoot.querySelector('#language');
   select.value='sl'; select.dispatchEvent(new dom.window.Event('change'));
   assert.equal(card._language,'sl'); assert.match(card.shadowRoot.textContent,/Veljavne možnosti/);
+  dom.window.close();
+});
+
+test('existing SQL sensor cross-check is read-only and never substitutes zero',()=>{
+  const {dom,card}=cardWith();
+  card._tab='databases';
+  card._hass={states:{}};
+  card.render();
+  assert.match(card.shadowRoot.textContent,/sensor\.ha_recorder_database_size was not found/);
+  assert.match(card.shadowRoot.textContent,/No zero value is assumed/);
+  card._hass.states['sensor.ha_recorder_database_size']={
+    state:'unavailable',attributes:{unit_of_measurement:'MiB'},
+  };
+  card.render();
+  assert.match(card.shadowRoot.textContent,/Comparison unavailable/);
+  assert.doesNotMatch(card.shadowRoot.textContent,/0\.00 MiB/);
+  card._hass.states['sensor.ha_recorder_database_size']={
+    state:'2045',attributes:{unit_of_measurement:'MiB'},
+  };
+  card.render();
+  assert.match(card.shadowRoot.textContent,/2045 MiB/);
+  assert.match(card.shadowRoot.textContent,/Recorder main minus SQL sensor/);
+  const websocketCalls=[];
+  card._hass.callWS=async message=>{websocketCalls.push(message);return {samples:[]};};
+  card.render();
+  assert.equal(websocketCalls.length,0,'rendering the comparison must not poll or query a sensor');
+  card.setConfig({language:'en',show_sql_cross_check:false});
+  card.render();
+  assert.doesNotMatch(card.shadowRoot.textContent,/Existing SQL sensor cross-check/);
   dom.window.close();
 });

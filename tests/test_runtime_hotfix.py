@@ -314,3 +314,108 @@ def test_two_hour_stale_path_updates_persistent_alert(tmp_path, monkeypatch):
     assert stale["active"] == 1
     assert stale["last_notify_at"] == now
     assert len(notifications) == 1
+
+
+def test_influx_startup_checkpoint_restart_failure_and_dst_scheduling(
+        tmp_path, monkeypatch):
+    runtime = _load_runtime(monkeypatch)
+    clock = [int(datetime(2026, 11, 10, 18, 34,
+                          tzinfo=runtime.TZ).timestamp())]
+    monkeypatch.setattr(runtime.time, "time", lambda: clock[0])
+    monkeypatch.setattr(runtime, "collect_local",
+                        lambda config, hour, measured: _samples(runtime, hour))
+    calls = []
+
+    async def successful(session, slug):
+        calls.append(clock[0])
+        return types.SimpleNamespace(
+            size=7 * GIB + len(calls), status="ok", detail="verified")
+
+    monkeypatch.setattr(runtime, "get_influx_usage", successful)
+    path = tmp_path / "restart"
+    path.mkdir()
+    first = runtime.StorageMonitor(StrictHass(path), Entry())
+    first.db.initialize()
+    _run(first.sample(False, startup=True))
+    first_result = {x["source"]: x for x in first.db.latest()}["influx_addon"]
+    assert first_result["status"] == "ok"
+    assert first_result["measured_at"] == calls[0]
+
+    # A new runtime instance uses the same monitor SQLite and cannot repeat the
+    # expensive scan after a quick restart.
+    clock[0] = int(datetime(2026, 11, 10, 19, 0,
+                            tzinfo=runtime.TZ).timestamp())
+    restarted = runtime.StorageMonitor(StrictHass(path), Entry())
+    _run(restarted.sample(False, startup=True))
+    assert len(calls) == 1
+    cached = {x["source"]: x for x in restarted.db.latest()}["influx_addon"]
+    assert cached["status"] == "cached"
+    assert cached["measured_at"] == first_result["measured_at"]
+
+    # Midnight is a requested local checkpoint, but only 5h26 has elapsed
+    # since the 18:34 attempt. Safety wins; the genuine timestamp is retained.
+    clock[0] = int(datetime(2026, 11, 11, 0, 0,
+                            tzinfo=runtime.TZ).timestamp())
+    _run(restarted.sample(True))
+    assert len(calls) == 1
+    midnight = {x["source"]: x for x in restarted.db.latest()}["influx_addon"]
+    assert midnight["status"] == "cached"
+    assert midnight["measured_at"] == first_result["measured_at"]
+    assert "deferred" in midnight["detail"]
+
+    # By 06:00 more than six elapsed hours have passed, so a fresh probe runs.
+    clock[0] = int(datetime(2026, 11, 11, 6, 0,
+                            tzinfo=runtime.TZ).timestamp())
+    _run(restarted.sample(True))
+    assert len(calls) == 2
+    six = {x["source"]: x for x in restarted.db.latest()}["influx_addon"]
+    assert six["status"] == "ok" and six["measured_at"] == clock[0]
+
+    # Failed attempts are reserved too, preventing restart retry storms.
+    failed_path = tmp_path / "failed"
+    failed_path.mkdir()
+    failure_calls = []
+
+    async def failed(session, slug):
+        failure_calls.append(clock[0])
+        return types.SimpleNamespace(size=None, status="unavailable",
+                                     detail="Supervisor denied access")
+
+    monkeypatch.setattr(runtime, "get_influx_usage", failed)
+    clock[0] = int(datetime(2026, 12, 1, 0, 0,
+                            tzinfo=runtime.TZ).timestamp())
+    failed_monitor = runtime.StorageMonitor(StrictHass(failed_path), Entry())
+    failed_monitor.db.initialize()
+    _run(failed_monitor.sample(True))
+    clock[0] += 60
+    failed_restart = runtime.StorageMonitor(StrictHass(failed_path), Entry())
+    _run(failed_restart.sample(False, startup=True))
+    assert len(failure_calls) == 1
+    unavailable = {x["source"]: x for x in failed_restart.db.latest()}["influx_addon"]
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["size"] is None
+
+    # Local checkpoint intervals are five elapsed hours in spring and seven in
+    # autumn. The strict six-hour rule skips the former and permits the latter.
+    for folder, start, end, expected in [
+        ("spring", datetime(2026, 3, 29, 0, tzinfo=runtime.TZ),
+         datetime(2026, 3, 29, 6, tzinfo=runtime.TZ), 1),
+        ("autumn", datetime(2026, 10, 25, 0, tzinfo=runtime.TZ),
+         datetime(2026, 10, 25, 6, tzinfo=runtime.TZ), 2),
+    ]:
+        dst_path = tmp_path / folder
+        dst_path.mkdir()
+        dst_calls = []
+
+        async def dst_success(session, slug):
+            dst_calls.append(clock[0])
+            return types.SimpleNamespace(size=GIB, status="ok", detail="verified")
+
+        monkeypatch.setattr(runtime, "get_influx_usage", dst_success)
+        dst_monitor = runtime.StorageMonitor(StrictHass(dst_path), Entry())
+        dst_monitor.db.initialize()
+        clock[0] = int(start.timestamp())
+        _run(dst_monitor.sample(True))
+        clock[0] = int(end.timestamp())
+        _run(dst_monitor.sample(True))
+        assert len(dst_calls) == expected
