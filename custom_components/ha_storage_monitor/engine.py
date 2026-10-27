@@ -106,6 +106,50 @@ class SnapshotDB:
             """)
             db.execute("""INSERT INTO metadata(key,value) VALUES('schema','2')
                 ON CONFLICT(key) DO UPDATE SET value='2'""")
+            self._migrate_influx_probe_metadata(db)
+
+    @staticmethod
+    def _migrate_influx_probe_metadata(db):
+        """Seed v0.2 probe state from the monitor's own beta.3 snapshots.
+
+        Successful snapshots contain an exact genuine ``measured_at``. A
+        legacy unavailable row is ambiguous: beta.3 used that status both for
+        an attempted failure and subsequent hourly copies. When it is newer
+        than the last success, conservatively use the end of its UTC hour as
+        the possible attempt time. This one-time fallback can postpone a scan,
+        but can never cause an extra expensive scan during an uncertain window.
+        """
+        keys = {row[0] for row in db.execute("""SELECT key FROM metadata
+            WHERE key IN ('influx_last_attempt_at','influx_last_success')""")}
+        if len(keys) == 2:
+            return
+        db.row_factory = sqlite3.Row
+        success = db.execute("""SELECT hour,size,method,measured_at,allocated,detail
+            FROM snapshots WHERE source='influx_addon' AND status='ok'
+              AND size IS NOT NULL AND measured_at IS NOT NULL
+            ORDER BY measured_at DESC,hour DESC LIMIT 1""").fetchone()
+        if success is not None and "influx_last_success" not in keys:
+            value = json.dumps({
+                "size": int(success["size"]),
+                "measured_at": int(success["measured_at"]),
+                "method": success["method"],
+                "allocated": success["allocated"],
+                "detail": success["detail"],
+            }, separators=(",", ":"))
+            db.execute("INSERT INTO metadata(key,value) VALUES(?,?)",
+                       ("influx_last_success", value))
+        if "influx_last_attempt_at" in keys:
+            return
+        candidate = int(success["measured_at"]) if success is not None else None
+        latest = db.execute("""SELECT hour,status FROM snapshots
+            WHERE source='influx_addon' ORDER BY hour DESC LIMIT 1""").fetchone()
+        if latest is not None and latest["status"] == "unavailable":
+            uncertain_upper_bound = int(latest["hour"]) + HOUR - 1
+            candidate = (uncertain_upper_bound if candidate is None else
+                         max(candidate, uncertain_upper_bound))
+        if candidate is not None:
+            db.execute("INSERT INTO metadata(key,value) VALUES(?,?)",
+                       ("influx_last_attempt_at", str(candidate)))
 
     def save(self, samples: Iterable[Sample]):
         rows = list(samples)

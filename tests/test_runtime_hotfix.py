@@ -419,3 +419,42 @@ def test_influx_startup_checkpoint_restart_failure_and_dst_scheduling(
         clock[0] = int(end.timestamp())
         _run(dst_monitor.sample(True))
         assert len(dst_calls) == expected
+
+
+def test_v02_upgrade_startup_reuses_recent_beta3_influx_snapshot(
+        tmp_path, monkeypatch):
+    runtime = _load_runtime(monkeypatch)
+    now = int(datetime(2026, 11, 10, 18, 34,
+                       tzinfo=runtime.TZ).timestamp())
+    measured = now - 2 * runtime.HOUR
+    monkeypatch.setattr(runtime.time, "time", lambda: now)
+    monkeypatch.setattr(runtime, "collect_local",
+                        lambda config, hour, actual: _samples(runtime, hour))
+    probes = []
+
+    async def forbidden_extra_probe(session, slug):
+        probes.append(now)
+        return types.SimpleNamespace(size=8 * GIB, status="ok", detail="new")
+
+    monkeypatch.setattr(runtime, "get_influx_usage", forbidden_extra_probe)
+    monitor = runtime.StorageMonitor(StrictHass(tmp_path), Entry())
+    monitor.db.initialize()
+    monitor.db.save([runtime.Sample(
+        runtime.utc_hour(measured), "influx_addon", 7 * GIB, "ok",
+        "supervisor_addons_data_total", measured,
+        detail="genuine beta.3 probe")])
+
+    async def scenario():
+        await monitor.start()
+        for task in tuple(monitor.entry.tasks):
+            await task
+
+    _run(scenario())
+    assert probes == []
+    row = {item["source"]: item for item in monitor.db.latest()}["influx_addon"]
+    assert row["status"] == "cached"
+    assert row["size"] == 7 * GIB
+    assert row["measured_at"] == measured
+    state = monitor.db.influx_probe_state()
+    assert state["last_attempt_at"] == measured
+    assert state["last_success"]["measured_at"] == measured

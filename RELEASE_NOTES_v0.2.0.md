@@ -20,6 +20,8 @@ The summary WebSocket response adds only `effective_options`, a non-secret copy 
 
 InfluxDB Supervisor scans now persist both the last attempted scan and last successful result in Storage Monitor's own SQLite. Startup and local 00/06/12/18 checkpoints request a scan, but the strict six-elapsed-hour minimum always takes precedence. For example, a startup scan at 18:34 makes midnight ineligible (5h26 elapsed), so midnight is cached or unavailable and 06:00 is the next eligible target. Spring 00→06 is five elapsed hours and is deferred; autumn 00→06 is seven and is eligible. Cached values retain their original measurement timestamp, stale and unavailable remain distinct, and only genuine fresh results enter the eight-day comparator.
 
+The first beta.3-to-v0.2 startup migrates this metadata from existing monitor-owned Influx snapshots before deciding whether to scan. Exact successful timestamps are retained. A newer ambiguous legacy `unavailable` row uses the end of its UTC snapshot hour as a conservative possible-attempt bound. This may defer one scan but avoids an extra scan inside an uncertain six-hour window. Fresh installations without historical rows are unaffected. No Recorder or InfluxDB query is used for migration.
+
 ## Controlled update and rollback
 
 Download the HACS update without deleting `/config/.storage/ha_storage_monitor_history.sqlite3`. Activation of updated integration Python requires a separately approved Home Assistant Core restart; a browser hard refresh then loads the new card resource. Keep the existing Lovelace dashboard and `/ha_storage_monitor/storage-monitor-card.js` resource.
