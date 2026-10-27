@@ -85,31 +85,104 @@ test('chart reports constant and small fluctuations without hiding precision',()
   dom.window.close();
 });
 
-test('chart leaves missing-hour gaps and treats DST by elapsed UTC time',()=>{
+test('chart leaves hourly gaps, excludes caches and treats DST by elapsed UTC time',()=>{
   const {dom,card}=cardWith();
   card._points=[
-    {hour:NOW-5*3600,size:100*MIB,status:'ok'},
-    {hour:NOW-4*3600,size:101*MIB,status:'ok'},
-    {hour:NOW-3600,size:99*MIB,status:'ok'},
-    {hour:NOW,size:100*MIB,status:'ok'},
+    {hour:NOW-2*3600,size:100*MIB,status:'ok'},
+    {hour:NOW,size:101*MIB,status:'ok'},
   ];
   let model=card._chartModel();
-  assert.equal(model.segments.length,2); assert.equal(model.missing,1); assert.equal(model.net,0);
+  assert.equal(model.segments.length,2,'one missing hourly observation must create a gap');
+  card._points=[
+    {hour:NOW-5*3600,size:100*MIB,status:'ok'},
+    {hour:NOW,size:100*MIB,status:'ok'},
+  ];
+  model=card._chartModel();
+  assert.equal(model.segments.length,2,'multiple missing hourly observations must create one visible gap');
+  card._points=[
+    {hour:NOW-2*3600,size:100*MIB,status:'ok'},
+    {hour:NOW-3600,size:100*MIB,status:'cached'},
+    {hour:NOW,size:101*MIB,status:'ok'},
+  ];
+  model=card._chartModel();
+  assert.equal(model.segments.length,2,'a cached hourly value must not bridge missing measurements');
+  assert.equal(model.cached,1);
   card._selected='influx_addon';
-  const fallback=Date.parse('2026-10-25T00:00:00Z')/1000;
+  card._points=[
+    {hour:NOW-6*3600,size:7*GIB,status:'ok'},
+    {hour:NOW-5*3600,size:7*GIB+MIB,status:'cached'},
+    {hour:NOW,size:7*GIB+2*MIB,status:'ok'},
+  ];
+  model=card._chartModel();
+  assert.equal(model.segments.length,1,'normal six-hour Influx cadence stays connected');
+  assert.equal(model.cached,1); assert.equal(model.measured.length,2);
+  assert.match(card.graph(),/cached values excluded/);
+  card._points=[
+    {hour:NOW-12*3600,size:7*GIB,status:'ok'},
+    {hour:NOW,size:7*GIB+2*MIB,status:'ok'},
+  ];
+  assert.equal(card._chartModel().segments.length,2,'a missing six-hour Influx measurement creates a gap');
+  const fallback=Date.parse('2026-10-24T22:00:00Z')/1000;
   card._points=[
     {hour:fallback,size:7*GIB,status:'ok'},
     {hour:fallback+3600,size:7*GIB+MIB,status:'cached'},
-    {hour:fallback+6*3600,size:7*GIB+2*MIB,status:'ok'},
+    {hour:fallback+7*3600,size:7*GIB+2*MIB,status:'ok'},
   ];
   model=card._chartModel();
-  assert.equal(model.segments.length,1,'six elapsed UTC hours across a DST transition stay connected');
-  assert.equal(model.cached,1); assert.equal(model.measured.length,2);
-  assert.match(card.graph(),/cached values excluded/);
-  const spring=Date.parse('2026-03-29T00:00:00Z')/1000;
+  assert.equal(model.segments.length,1,'seven-hour autumn fallback Influx interval stays connected');
+  const spring=Date.parse('2026-03-28T23:00:00Z')/1000;
+  card._points=[
+    {hour:spring,size:7*GIB,status:'ok'},
+    {hour:spring+3600,size:7*GIB+MIB,status:'cached'},
+    {hour:spring+5*3600,size:7*GIB+2*MIB,status:'ok'},
+  ];
+  assert.equal(card._chartModel().segments.length,1,'five-hour spring-forward Influx interval stays connected');
   card._selected='recorder_total';
   card._points=[0,1,2].map(index=>({hour:spring+index*3600,size:100*MIB+index,status:'ok'}));
   assert.equal(card._chartModel().segments.length,1,'spring-forward UTC hours stay continuous');
+  card._points=[0,1,2].map(index=>({hour:fallback+index*3600,size:100*MIB+index,status:'ok'}));
+  assert.equal(card._chartModel().segments.length,1,'autumn fallback UTC hours stay continuous');
+  dom.window.close();
+});
+
+test('growth alarms expose durable 24-hour and seven-day acknowledgments',async()=>{
+  const active=summary({
+    alerts:{disk_low:{active:0},recorder_total:{active:1,acknowledged_until:0}},
+    growth:{recorder_total:{status:'alarm',delta24:220*MIB,baseline_daily:200*MIB,excess_ratio:.1}},
+  });
+  const {dom,card}=cardWith(active);
+  dom.window.confirm=()=>true;
+  const calls=[];
+  card._hass={callWS:async message=>{
+    calls.push(message);
+    active.alerts.recorder_total.acknowledged_until=NOW+Number(message.hours)*3600;
+  }};
+  card.reload=async()=>{card._data=active;card.render();};
+  card._tab='alerts'; card.render();
+  let controls=[...card.shadowRoot.querySelectorAll('[data-ack="recorder_total"]')];
+  assert.deepEqual(controls.map(button=>button.dataset.hours),['24','168']);
+  assert.match(card.shadowRoot.textContent,/Not acknowledged/);
+  controls[0].click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(calls[0].type,'ha_storage_monitor/acknowledge');
+  assert.equal(calls[0].source,'recorder_total');
+  assert.equal(calls[0].hours,24);
+  assert.match(card.shadowRoot.textContent,/Acknowledged until/);
+  controls=[...card.shadowRoot.querySelectorAll('[data-ack="recorder_total"]')];
+  controls[1].click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(calls[1].hours,168);
+  card._data=summary({
+    alerts:{disk_low:{active:0},recorder_total:{active:1,acknowledged_until:NOW+168*3600}},
+    growth:active.growth,
+  });
+  card.render();
+  assert.match(card.shadowRoot.textContent,/Acknowledged until/,'returned acknowledgment state must survive refresh');
+  card._data.alerts.recorder_total={active:0,acknowledged_until:NOW-1};
+  card._data.growth.recorder_total={status:'normal',delta24:10*MIB,baseline_daily:20*MIB,excess_ratio:null};
+  card.render();
+  assert.equal(card.shadowRoot.querySelectorAll('[data-ack="recorder_total"]').length,0);
+  assert.match(card.shadowRoot.textContent,/Clear/);
   dom.window.close();
 });
 
