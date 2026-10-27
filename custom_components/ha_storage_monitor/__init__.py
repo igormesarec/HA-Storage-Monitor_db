@@ -41,8 +41,6 @@ class StorageMonitor:
         self.unsub=None
         self._running=False
         self._pending_check=False
-        self.cache_influx: Sample | None=None
-        self.last_influx_probe: int | None=None
         self._last_disk_low=False
         self.options=resolved_options(entry.data,entry.options)
         self.writer_diagnostics_enabled=False
@@ -58,7 +56,7 @@ class StorageMonitor:
         self.unsub = async_track_time_change(self.hass,self._hourly,minute=0,second=10)
         # Cold start updates current measurements without firing historical growth alerts.
         self.entry.async_create_background_task(
-            self.hass,self.sample(False),"Storage Monitor startup")
+            self.hass,self.sample(False,startup=True),"Storage Monitor startup")
 
     @callback
     def _hourly(self, now: datetime):
@@ -70,7 +68,7 @@ class StorageMonitor:
             self.hass,self.sample(local.hour in ALARM_HOURS),
             "Storage Monitor hourly sample")
 
-    async def sample(self, check: bool):
+    async def sample(self, check: bool, *, startup: bool=False):
         if self._running:
             # A cold-start sample can overlap the first scheduled checkpoint.
             # Queue that checkpoint instead of dropping it; the immutable
@@ -83,26 +81,46 @@ class StorageMonitor:
             hour=utc_hour(now)
             local_now=datetime.fromtimestamp(now,TZ)
             samples=await self.hass.async_add_executor_job(collect_local,self.hass.config.config_dir,hour,now)
-            # Directory walk capped at once per 6h (or cold boot), never every hour.
-            # Do not walk the Supervisor directory tree more than once in any
-            # six elapsed hours, including immediately after cold startup.
-            fetch_influx=(self.last_influx_probe is None or
-                          (check and now-self.last_influx_probe>=6*HOUR))
+            # A startup or local 00/06/12/18 checkpoint may request the
+            # expensive Supervisor scan. Reserve the attempt durably first:
+            # failures and quick restarts still observe the strict six elapsed
+            # hour minimum. Exact checkpoint alignment deliberately yields to
+            # this safety limit when the two requirements conflict.
+            requested_influx = startup or check
+            fetch_influx = False
+            if requested_influx:
+                fetch_influx=await self.hass.async_add_executor_job(
+                    self.db.reserve_influx_probe,now,6*HOUR)
+            probe_state=await self.hass.async_add_executor_job(
+                self.db.influx_probe_state)
             if fetch_influx:
-                self.last_influx_probe=now
                 usage=await get_influx_usage(async_get_clientsession(self.hass),DEFAULT_INFLUX_SLUG)
-                self.cache_influx=Sample(hour,"influx_addon",usage.size,usage.status,
-                                         "supervisor_addons_data_total",now if usage.status=="ok" else None,
-                                         detail=usage.detail)
-            if self.cache_influx and not fetch_influx and self.cache_influx.status=="ok":
-                samples.append(Sample(hour,"influx_addon",self.cache_influx.size,"cached",
-                                      "supervisor_addons_data_total",self.cache_influx.measured_at,
-                                      detail="Previously measured; not a fresh hourly read"))
+                current=Sample(hour,"influx_addon",usage.size,usage.status,
+                               "supervisor_addons_data_total",now if usage.status=="ok" else None,
+                               detail=usage.detail)
+                samples.append(current)
+                if current.status=="ok":
+                    await self.hass.async_add_executor_job(
+                        self.db.save_influx_success,current)
             else:
-                src=self.cache_influx
-                samples.append(Sample(hour,"influx_addon",src.size if src else None,
-                                      src.status if src else "unavailable","supervisor_addons_data_total",
-                                      src.measured_at if src else None,detail=src.detail if src else "No probe"))
+                cached=probe_state["last_success"]
+                if cached:
+                    age=max(0,now-int(cached["measured_at"]))
+                    status="cached" if age < 7*HOUR else "stale"
+                    reason=("Six-hour safety minimum deferred this requested probe"
+                            if requested_influx else
+                            "Previously measured; not a fresh hourly read")
+                    samples.append(Sample(
+                        hour,"influx_addon",int(cached["size"]),status,
+                        str(cached.get("method") or "supervisor_addons_data_total"),
+                        int(cached["measured_at"]),cached.get("allocated"),
+                        detail=reason))
+                else:
+                    detail=("Six-hour safety minimum deferred this requested probe; "
+                            "no successful result is cached" if requested_influx else
+                            "No successful Supervisor probe is cached")
+                    samples.append(Sample(hour,"influx_addon",None,"unavailable",
+                                          "supervisor_addons_data_total",None,detail=detail))
             # Record disappeared local SQLite files as unavailable, not as a false zero.
             former=await self.hass.async_add_executor_job(self.db.latest)
             discovered={s.source for s in samples}
@@ -228,7 +246,7 @@ class StorageMonitor:
             previous=await self.hass.async_add_executor_job(self.db.get_alert,"stale:"+key)
             last=await self.hass.async_add_executor_job(self.db.last_two,key)
             stale=(not fresh and len(last)==2 and last[0]["hour"]-last[1]["hour"]==HOUR
-                   and all(x["status"]=="unavailable" or (x["measured_at"] is None)
+                   and all(x["status"] in ("unavailable","stale") or (x["measured_at"] is None)
                            for x in last))
             notify=stale and allow_notification(previous,window,hour) and (
                  not previous["active"] or bool(self.options.get("repeat_notifications",False)))
@@ -322,6 +340,13 @@ class StorageMonitor:
         return {"samples":items,"alerts":alerts,"growth":growth,"writers":writers,
                 "now":int(time.time()),"timezone":"Europe/Ljubljana","changes":changes,
                 "writer_diagnostics_enabled":self.writer_diagnostics_enabled,
+                "effective_options":{
+                    "low_disk_gib":int(self.options["low_disk_gib"]),
+                    "min_excess_mib":int(self.options["min_excess_mib"]),
+                    "retention_days":int(self.options["retention_days"]),
+                    "repeat_notifications":bool(self.options["repeat_notifications"]),
+                    "enable_recorder_writer_diagnostics":self.writer_diagnostics_enabled,
+                },
                 "baseline":"24h size change compared with average DAILY growth of preceding seven days; strictly >5%",
                 "scope":"Filesystem file stat reports apparent bytes, disk usage is scoped to /config path, Supervisor is add-on total"}
 

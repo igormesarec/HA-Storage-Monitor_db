@@ -194,3 +194,59 @@ def test_writer_diagnostics_state_survives_reload_and_resets_after_disable(tmp_p
     assert db.configure_writer_diagnostics(False,400) is None
     # Re-enabling after an explicit disable starts a new non-retroactive run.
     assert db.configure_writer_diagnostics(True,500)==500
+
+
+def test_influx_probe_attempt_and_success_survive_restart(tmp_path):
+    path=tmp_path/'own.sqlite3';db=SnapshotDB(path);db.initialize()
+    assert db.reserve_influx_probe(T)
+    assert not SnapshotDB(path).reserve_influx_probe(T+HOUR)
+    sample=Sample(T,'influx_addon',12345,'ok','supervisor_addons_data_total',T+17,
+                  detail='verified add-on total')
+    db.save_influx_success(sample)
+    state=SnapshotDB(path).influx_probe_state()
+    assert state['last_attempt_at']==T
+    assert state['last_success']['size']==12345
+    assert state['last_success']['measured_at']==T+17
+    assert state['last_success']['detail']=='verified add-on total'
+    assert SnapshotDB(path).reserve_influx_probe(T+6*HOUR)
+
+
+def test_beta3_influx_snapshot_seeds_upgrade_metadata_and_restart(tmp_path):
+    path=tmp_path/'beta3.sqlite3';legacy=SnapshotDB(path);legacy.initialize()
+    measured=T-2*HOUR+321
+    legacy.save([
+        Sample(T-2*HOUR,'influx_addon',98765,'ok',
+               'supervisor_addons_data_total',measured,detail='genuine beta.3 probe'),
+        Sample(T-HOUR,'influx_addon',98765,'cached',
+               'supervisor_addons_data_total',measured,detail='legacy cache'),
+    ])
+    upgraded=SnapshotDB(path);upgraded.initialize()
+    state=upgraded.influx_probe_state()
+    assert state['last_attempt_at']==measured
+    assert state['last_success']['size']==98765
+    assert state['last_success']['measured_at']==measured
+    assert state['last_success']['detail']=='genuine beta.3 probe'
+    assert not upgraded.reserve_influx_probe(measured+5*HOUR)
+    # A second initialization is idempotent and keeps the exact migration.
+    restarted=SnapshotDB(path);restarted.initialize()
+    assert restarted.influx_probe_state()==state
+    assert restarted.reserve_influx_probe(measured+6*HOUR)
+
+
+def test_fresh_install_without_influx_history_allows_first_probe(tmp_path):
+    db=SnapshotDB(tmp_path/'fresh.sqlite3');db.initialize()
+    assert db.influx_probe_state()=={'last_attempt_at':None,'last_success':None}
+    assert db.reserve_influx_probe(T)
+
+
+def test_beta3_unavailable_snapshot_uses_conservative_attempt_fallback(tmp_path):
+    path=tmp_path/'uncertain.sqlite3';legacy=SnapshotDB(path);legacy.initialize()
+    legacy.save([Sample(T-HOUR,'influx_addon',None,'unavailable',
+                        'supervisor_addons_data_total',None,
+                        detail='legacy status cannot identify attempt')])
+    upgraded=SnapshotDB(path);upgraded.initialize()
+    state=upgraded.influx_probe_state()
+    assert state['last_success'] is None
+    assert state['last_attempt_at']==T-1
+    assert not upgraded.reserve_influx_probe(T+5*HOUR-2)
+    assert upgraded.reserve_influx_probe(T+6*HOUR-1)

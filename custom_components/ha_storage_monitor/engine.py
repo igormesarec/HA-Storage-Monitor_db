@@ -20,7 +20,7 @@ class Sample:
     hour: int  # UTC epoch-hour identity, including separate DST fallback 02:00s
     source: str
     size: int | None
-    status: str  # ok / cached / unavailable
+    status: str  # ok / cached / stale / unavailable
     method: str
     measured_at: int | None
     allocated: int | None = None
@@ -106,6 +106,50 @@ class SnapshotDB:
             """)
             db.execute("""INSERT INTO metadata(key,value) VALUES('schema','2')
                 ON CONFLICT(key) DO UPDATE SET value='2'""")
+            self._migrate_influx_probe_metadata(db)
+
+    @staticmethod
+    def _migrate_influx_probe_metadata(db):
+        """Seed v0.2 probe state from the monitor's own beta.3 snapshots.
+
+        Successful snapshots contain an exact genuine ``measured_at``. A
+        legacy unavailable row is ambiguous: beta.3 used that status both for
+        an attempted failure and subsequent hourly copies. When it is newer
+        than the last success, conservatively use the end of its UTC hour as
+        the possible attempt time. This one-time fallback can postpone a scan,
+        but can never cause an extra expensive scan during an uncertain window.
+        """
+        keys = {row[0] for row in db.execute("""SELECT key FROM metadata
+            WHERE key IN ('influx_last_attempt_at','influx_last_success')""")}
+        if len(keys) == 2:
+            return
+        db.row_factory = sqlite3.Row
+        success = db.execute("""SELECT hour,size,method,measured_at,allocated,detail
+            FROM snapshots WHERE source='influx_addon' AND status='ok'
+              AND size IS NOT NULL AND measured_at IS NOT NULL
+            ORDER BY measured_at DESC,hour DESC LIMIT 1""").fetchone()
+        if success is not None and "influx_last_success" not in keys:
+            value = json.dumps({
+                "size": int(success["size"]),
+                "measured_at": int(success["measured_at"]),
+                "method": success["method"],
+                "allocated": success["allocated"],
+                "detail": success["detail"],
+            }, separators=(",", ":"))
+            db.execute("INSERT INTO metadata(key,value) VALUES(?,?)",
+                       ("influx_last_success", value))
+        if "influx_last_attempt_at" in keys:
+            return
+        candidate = int(success["measured_at"]) if success is not None else None
+        latest = db.execute("""SELECT hour,status FROM snapshots
+            WHERE source='influx_addon' ORDER BY hour DESC LIMIT 1""").fetchone()
+        if latest is not None and latest["status"] == "unavailable":
+            uncertain_upper_bound = int(latest["hour"]) + HOUR - 1
+            candidate = (uncertain_upper_bound if candidate is None else
+                         max(candidate, uncertain_upper_bound))
+        if candidate is not None:
+            db.execute("INSERT INTO metadata(key,value) VALUES(?,?)",
+                       ("influx_last_attempt_at", str(candidate)))
 
     def save(self, samples: Iterable[Sample]):
         rows = list(samples)
@@ -121,6 +165,69 @@ class SnapshotDB:
                  allocated=excluded.allocated, detail=excluded.detail
                WHERE NOT (snapshots.status='ok' AND excluded.status!='ok')
              """, [(s.hour,s.source,s.size,s.status,s.method,s.measured_at,s.allocated,s.detail[:150]) for s in rows])
+
+    def reserve_influx_probe(self, now: int, minimum_elapsed: int = 6 * HOUR) -> bool:
+        """Atomically reserve one expensive Supervisor scan.
+
+        The attempt is persisted before network I/O so a failed probe or quick
+        Home Assistant restart cannot immediately repeat the directory scan.
+        """
+        now = int(now)
+        with _raw_connection(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT value FROM metadata WHERE key='influx_last_attempt_at'"
+            ).fetchone()
+            if row is not None:
+                try:
+                    if now - int(row[0]) < int(minimum_elapsed):
+                        return False
+                except (TypeError, ValueError):
+                    # Replace malformed legacy metadata; do not lose all
+                    # storage sampling because one monitor-owned key is bad.
+                    pass
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('influx_last_attempt_at',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (str(now),))
+            return True
+
+    def save_influx_success(self, sample: Sample):
+        """Persist the last genuine Supervisor result for safe cache reuse."""
+        if (sample.source != "influx_addon" or sample.status != "ok"
+                or sample.size is None or sample.measured_at is None):
+            raise ValueError("Only a genuine InfluxDB measurement can be cached")
+        value = json.dumps({
+            "size": int(sample.size),
+            "measured_at": int(sample.measured_at),
+            "method": sample.method,
+            "allocated": sample.allocated,
+            "detail": sample.detail,
+        }, separators=(",", ":"))
+        with _raw_connection(self.path) as db:
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('influx_last_success',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (value,))
+
+    def influx_probe_state(self) -> dict:
+        """Return durable attempt and success state, tolerating old archives."""
+        with _raw_connection(self.path) as db:
+            rows = dict(db.execute("""SELECT key,value FROM metadata
+                WHERE key IN ('influx_last_attempt_at','influx_last_success')""").fetchall())
+        attempt = None
+        success = None
+        try:
+            attempt = int(rows["influx_last_attempt_at"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            parsed = json.loads(rows["influx_last_success"])
+            if (isinstance(parsed, dict) and isinstance(parsed.get("size"), int)
+                    and isinstance(parsed.get("measured_at"), int)):
+                success = parsed
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return {"last_attempt_at": attempt, "last_success": success}
 
     def latest(self):
         with _raw_connection(self.path) as db:
