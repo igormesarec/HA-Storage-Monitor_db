@@ -9,8 +9,11 @@ class HAStorageMonitorCard extends HTMLElement {
     this._language = 'en';
     this._data = null;
     this._points = [];
+    this._writerLimit = 20;
+    this._writerPage = 1;
+    this._writerData = null;
   }
-  setConfig(config) { this._config = config || {}; this._language = config?.language === 'sl' ? 'sl' : 'en'; }
+  setConfig(config) { this._config = config || {}; this._language = config?.language === 'sl' ? 'sl' : 'en'; const limit=Number(config?.writer_limit); if([20,50,100,500].includes(limit)){this._writerLimit=limit;this._writerPage=1;} }
   set hass(hass) { this._hass = hass; if (!this._started) { this._started = true; this.reload(); } }
   connectedCallback() { if (!this._timer) this._timer = setInterval(() => this._hass && this.reload(), 300000); }
   disconnectedCallback() { if (this._timer) clearInterval(this._timer); this._timer = null; }
@@ -30,12 +33,18 @@ class HAStorageMonitorCard extends HTMLElement {
   }
   samples() { return Object.fromEntries((this._data?.samples || []).map(row => [row.source, row])); }
   async reload() {
-    try { this._data = await this._hass.callWS({type:'ha_storage_monitor/summary'}); this._error = null; await this.loadHistory(); }
+    try { this._data = await this._hass.callWS({type:'ha_storage_monitor/summary'}); this._error = null; await this.loadHistory(); if(this._tab==='writers')await this.loadWriters(); }
     catch (error) { this._error = error?.message || String(error); this.render(); }
   }
   async loadHistory() {
     try { const result = await this._hass.callWS({type:'ha_storage_monitor/history', source:this._selected, days:this._days}); this._points = result.samples || []; }
     catch (_) { this._points = []; }
+    this.render();
+  }
+  async loadWriters() {
+    if(!this._data?.writer_diagnostics_enabled){this._writerData=this._data?.writers||null;this._writerError=null;this.render();return;}
+    try { this._writerData=await this._hass.callWS({type:'ha_storage_monitor/writers',limit:this._writerLimit,page:this._writerPage});this._writerError=null; }
+    catch(error){this._writerError=error?.message||String(error);}
     this.render();
   }
   styles() { return `<style>
@@ -52,9 +61,11 @@ class HAStorageMonitorCard extends HTMLElement {
     const views = {overview:()=>this.overview(),databases:()=>this.databases(),charts:()=>this.charts(),writers:()=>this.writers(),disk:()=>this.disk(),alerts:()=>this.alerts(),settings:()=>this.settings()};
     const body = this._error ? `<p class="alert">${this.esc(this._error)}</p>` : !this._data ? this.t('Loading…','Nalaganje…') : views[this._tab]();
     this.shadowRoot.innerHTML = `${this.styles()}<ha-card><div class="wrap"><h2>${this.t('Home Assistant Storage Monitor','Nadzor prostora podatkovnih baz')}</h2><nav>${tabs.map(([key,name]) => `<button data-tab="${key}" aria-current="${key === this._tab}">${name}</button>`).join('')}</nav>${body}</div></ha-card>`;
-    this.shadowRoot.querySelectorAll('[data-tab]').forEach(el => el.onclick = () => { this._tab = el.dataset.tab; this.render(); });
+    this.shadowRoot.querySelectorAll('[data-tab]').forEach(el => el.onclick = () => { this._tab = el.dataset.tab; if(this._tab==='writers')this.loadWriters();else this.render(); });
     this.shadowRoot.querySelectorAll('[data-days]').forEach(el => el.onclick = () => { this._days = Number(el.dataset.days); this.loadHistory(); });
     const source = this.shadowRoot.querySelector('#source'); if (source) source.onchange = event => { this._selected = event.target.value; this.loadHistory(); };
+    const writerLimit=this.shadowRoot.querySelector('#writer-limit'); if(writerLimit)writerLimit.onchange=event=>{const limit=Number(event.target.value);if(![20,50,100,500].includes(limit))return;this._writerLimit=limit;this._writerPage=1;this.loadWriters();};
+    this.shadowRoot.querySelectorAll('[data-writer-page]').forEach(el=>el.onclick=()=>{this._writerPage=Number(el.dataset.writerPage);this.loadWriters();});
     const refresh = this.shadowRoot.querySelector('#refresh'); if (refresh) refresh.onclick = () => this.reload();
     const language = this.shadowRoot.querySelector('#language'); if (language) language.onchange = event => { this._language = event.target.value; this.render(); };
     this.shadowRoot.querySelectorAll('[data-ack]').forEach(el => el.onclick = async () => { const hours = Number(el.dataset.hours || 24); if (!window.confirm(this.t('Mute this alert?','Utišam to opozorilo?'))) return; await this._hass.callWS({type:'ha_storage_monitor/acknowledge',source:el.dataset.ack,hours}); await this.reload(); });
@@ -130,13 +141,20 @@ class HAStorageMonitorCard extends HTMLElement {
     const writer=this._data.writers||{};
     return writer.status==='disabled'?`<p><strong>${this.t('Recorder writer diagnostics disabled','Diagnostika zapisovalcev Recorderja je izklopljena')}</strong></p><p class="muted">${this.t('No Recorder query is made and no missed interval is backfilled.','Recorder se ne poizveduje in zamujeni intervali se ne dopolnjujejo.')}</p>`:`<p>${this.t('Status','Stanje')}: <strong>${this.esc(writer.status||'learning')}</strong><br>${this.t('Verified intervals','Potrjeni intervali')}: ${this.esc(writer.intervals_verified??'—')}/${this.esc(writer.intervals_required??'—')}</p>`;
   }
+  writerControls(writer) {
+    const pages=Number(writer?.total_pages||0),page=Number(writer?.page||this._writerPage);
+    const pagination=pages>1?`<div class="row"><button data-writer-page="${page-1}" ${page<=1?'disabled':''}>${this.t('Previous','Prejšnja')}</button><span>${this.t('Page','Stran')} ${page}/${pages}</span><button data-writer-page="${page+1}" ${page>=pages?'disabled':''}>${this.t('Next','Naslednja')}</button></div>`:'';
+    return `<div class="row"><label>${this.t('Entity ranking','Razvrstitev entitet')} <select id="writer-limit">${[20,50,100,500].map(limit=>`<option value="${limit}" ${limit===this._writerLimit?'selected':''}>Top ${limit}</option>`).join('')}</select></label>${pagination}</div>`;
+  }
   writers() {
-    const writer=this._data.writers||{};
-    if(writer.status==='disabled')return `<div class="help"><strong>${this.t('Recorder writer diagnostics disabled','Diagnostika zapisovalcev Recorderja je izklopljena')}</strong><br>${this.t('Size monitoring, disk alarms, Supervisor probes and independent history continue. No Recorder query is made and no missed interval is queried retroactively.','Meritve velikosti, alarmi prostora, poizvedbe Supervisorja in neodvisna zgodovina delujejo naprej. Recorder se ne poizveduje in zamujeni intervali se ne pridobivajo za nazaj.')}</div>`;
+    const writer=this._writerData||this._data.writers||{},controls=this.writerControls(writer);
+    if(writer.status==='disabled')return `${controls}<div class="help"><strong>${this.t('Recorder writer diagnostics disabled','Diagnostika zapisovalcev Recorderja je izklopljena')}</strong><br>${this.t('Size monitoring, disk alarms, Supervisor probes and independent history continue. No Recorder query is made and no missed interval is queried retroactively.','Meritve velikosti, alarmi prostora, poizvedbe Supervisorja in neodvisna zgodovina delujejo naprej. Recorder se ne poizveduje in zamujeni intervali se ne pridobivajo za nazaj.')}</div>`;
     const pending=this.t('Learning','Učenje'), value=(item,suffix='')=>item==null?pending:`${this.esc(item)}${suffix}`;
-    const entities=(writer.entities||[]).map((row,index)=>`<tr><td>${index+1}</td><td title="${this.esc(row.entity_id)}">${this.esc(row.entity_id)}</td><td>${this.esc(row.integration||'unknown')}</td><td>${value(row.rows_6h)}</td><td>${value(row.rows_24h)}</td><td>${value(row.share_percent,'%')}</td><td>${value(row.rate_per_min)}</td><td>${value(row.previous7_daily)}</td><td>${value(row.ratio,row.ratio==null?'':'×')}</td><td class="${row.high_writer?'alert':row.rows_24h==null||row.previous7_daily==null?'warning':'okay'}">${row.high_writer?this.t('Warning','Opozorilo'):row.rows_24h==null||row.previous7_daily==null?pending:this.t('No','Ne')}</td></tr>`).join('');
-    const integrations=(writer.top20_grouped_by_integration||[]).map(row=>`<tr><td>${this.esc(row.integration)}</td><td>${this.esc(row.rows_6h??'—')}</td><td>${this.esc(row.rows_24h??'—')}</td><td>${this.esc(row.entities_in_top20)}</td></tr>`).join('');
-    return `<div class="help">${this.t('Recorder state row counts, not attributable storage bytes. Only complete bounded six-hour intervals are shown; missing intervals stay missing.','Število vrstic stanj Recorderja, ne pripisljivi bajti. Prikazani so le zaključeni omejeni šesturni intervali; manjkajoči ostanejo manjkajoči.')}</div><h3>${this.t('Partial integration totals derived from Top 20 entities','Delni seštevki integracij iz prvih 20 entitet')}</h3><p class="muted">${this.t('These are not complete integration totals; entities outside the Top 20 are excluded.','To niso popolni seštevki integracij; entitete zunaj prvih 20 so izključene.')}</p><div class="table-scroll"><table class="table"><thead><tr><th>Integration</th><th>6h</th><th>${this.t('Local day','Lokalni dan')}</th><th>Entities</th></tr></thead><tbody>${integrations}</tbody></table></div><h3 class="section">${this.t('Entities','Entitete')}</h3><div class="table-scroll"><table class="table"><thead><tr><th>#</th><th>Entity ID</th><th>Integration</th><th>${this.t('Latest verified 6h','Zadnjih potrjenih 6h')}</th><th>${this.t('Last complete local day','Zadnji popolni lokalni dan')}</th><th>${this.t('Share of writes','Delež zapisov')}</th><th>${this.t('Records/min','Zapisov/min')}</th><th>${this.t('Prior 7d daily avg','Dnevno povp. prejšnjih 7d')}</th><th>${this.t('Growth ratio','Razmerje rasti')}</th><th>${this.t('High writer','Veliko zapisov')}</th></tr></thead><tbody>${entities}</tbody></table></div>`;
+    const offset=(Number(writer.page||1)-1)*Number(writer.page_size||50);
+    const entities=(writer.entities||[]).map((row,index)=>`<tr><td>${offset+index+1}</td><td title="${this.esc(row.entity_id)}">${this.esc(row.entity_id)}</td><td>${this.esc(row.integration||'unknown')}</td><td>${value(row.rows_6h)}</td><td>${value(row.rows_24h)}</td><td>${value(row.share_percent,'%')}</td><td>${value(row.rate_per_min)}</td><td>${value(row.previous7_daily)}</td><td>${value(row.ratio,row.ratio==null?'':'×')}</td><td class="${row.high_writer?'alert':row.rows_24h==null||row.previous7_daily==null?'warning':'okay'}">${row.high_writer?this.t('Warning','Opozorilo'):row.rows_24h==null||row.previous7_daily==null?pending:this.t('No','Ne')}</td></tr>`).join('');
+    const integrations=(writer.grouped_by_integration||[]).map(row=>`<tr><td>${this.esc(row.integration)}</td><td>${this.esc(row.rows_6h??'—')}</td><td>${this.esc(row.rows_24h??'—')}</td><td>${this.esc(row.entities_in_selected)}</td></tr>`).join('');
+    const partial=this.t(`Partial integration totals derived from selected Top ${this._writerLimit}`,`Delni seštevki integracij iz izbranih prvih ${this._writerLimit}`),excluded=this.t(`These are not complete integration totals; entities outside the selected Top ${this._writerLimit} are excluded.`,`To niso popolni seštevki integracij; entitete zunaj izbranih prvih ${this._writerLimit} so izključene.`);
+    return `${controls}${this._writerError?`<p class="alert">${this.esc(this._writerError)}</p>`:''}<div class="help">${this.t('Recorder state row counts, not attributable storage bytes. Only complete bounded six-hour intervals are shown; missing intervals stay missing. Changing the ranking reads only Storage Monitor history and never queries Recorder.','Število vrstic stanj Recorderja, ne pripisljivi bajti. Prikazani so le zaključeni omejeni šesturni intervali; manjkajoči ostanejo manjkajoči. Sprememba razvrstitve bere le zgodovino Storage Monitorja in nikoli ne poizveduje Recorderja.')}</div><h3>${partial}</h3><p class="muted">${excluded}</p><div class="table-scroll"><table class="table"><thead><tr><th>Integration</th><th>6h</th><th>${this.t('Local day','Lokalni dan')}</th><th>Entities</th></tr></thead><tbody>${integrations}</tbody></table></div><h3 class="section">${this.t('Entities','Entitete')}</h3><div class="table-scroll"><table class="table"><thead><tr><th>#</th><th>Entity ID</th><th>Integration</th><th>${this.t('Latest verified 6h','Zadnjih potrjenih 6h')}</th><th>${this.t('Last complete local day','Zadnji popolni lokalni dan')}</th><th>${this.t('Share of writes','Delež zapisov')}</th><th>${this.t('Records/min','Zapisov/min')}</th><th>${this.t('Prior 7d daily avg','Dnevno povp. prejšnjih 7d')}</th><th>${this.t('Growth ratio','Razmerje rasti')}</th><th>${this.t('High writer','Veliko zapisov')}</th></tr></thead><tbody>${entities}</tbody></table></div>`;
   }
   disk() {
     const samples=this.samples(), total=samples.disk_total?.size, used=samples.disk_used?.size, available=samples.disk_free?.size;

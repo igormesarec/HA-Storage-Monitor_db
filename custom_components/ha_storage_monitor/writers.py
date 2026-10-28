@@ -23,6 +23,8 @@ MAX_ENTITIES = 5000
 MAX_JSON_BYTES = 256 * 1024
 # A hard cap on rows visited avoids sustained Recorder reads during a write storm.
 MAX_ROWS = 500_000
+WRITER_RANKING_LIMITS = (20, 50, 100, 500)
+WRITER_PAGE_SIZE = 50
 
 
 def local_checkpoint_window(when: datetime) -> tuple[int, int]:
@@ -149,13 +151,16 @@ def disabled_writer_summary() -> dict:
     }
 
 
-def summarize_writer_windows(rows: list[dict], end_ts: int) -> dict:
+def summarize_writer_windows(rows: list[dict], end_ts: int,
+                             limit: int = 20) -> dict:
     """Summarize four saved local checkpoints/day over eight real days.
 
     Each interval is checked for exact UTC start/end and success. DST days
     contain 23 or 25 elapsed hours, which is disclosed. This diagnostic is
     not used for the strict 24-hour STORAGE SIZE growth alert.
     """
+    if type(limit) is not int or limit not in WRITER_RANKING_LIMITS:
+        raise ValueError("Writer ranking limit must be 20, 50, 100, or 500")
     end_local = datetime.fromtimestamp(end_ts, TZ)
     if end_local.hour not in (0, 6, 12, 18) or end_local.minute != 0:
         return {"status": "unavailable", "reason": "Not at a scheduled checkpoint", "entities": []}
@@ -206,7 +211,7 @@ def summarize_writer_windows(rows: list[dict], end_ts: int) -> dict:
         rank = {}
         period = "unavailable"
     entities = []
-    for name, count in sorted(rank.items(), key=lambda x: (-x[1], x[0]))[:20]:
+    for name, count in sorted(rank.items(), key=lambda x: (-x[1], x[0]))[:limit]:
         prior = previous7[0].get(name, 0) / 7 if previous7 else None
         count24 = last24[0].get(name, 0) if last24 else None
         count6 = last6[0].get(name, 0) if last6 else None
@@ -238,6 +243,9 @@ def summarize_writer_windows(rows: list[dict], end_ts: int) -> dict:
         "previous7_complete": previous7 is not None,
         "last24_elapsed_hours": last24_hours,
         "ranking_period": period,
+        "selected_limit": limit,
+        "ranked_entities_available": len(rank),
+        "selected_entities_count": len(entities),
         "all_recorder_rows_24h": last24[1] if last24 else None,
         "entities": entities,
         "caveat": "Recorder state ROW counts, not physical bytes. Last four local checkpoints span 23/25h on DST transitions; missing windows are never interpolated.",

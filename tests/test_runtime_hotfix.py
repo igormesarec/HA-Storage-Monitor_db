@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import ast
-from datetime import datetime
+from datetime import datetime, timedelta
 import importlib.util
 from pathlib import Path
 import sys
@@ -199,7 +199,72 @@ def test_startup_writer_off_normal_disk_unavailable_influx_and_summary(
     }
     assert connection.results[0][0] == 7
     assert connection.results[0][1]["writer_diagnostics_enabled"] is False
-    assert not connection.errors
+
+
+def test_writer_ranking_websocket_pages_monitor_history_without_recorder_query(
+        tmp_path, monkeypatch):
+    runtime=_load_runtime(monkeypatch)
+    end=datetime(2026,11,10,18,tzinfo=runtime.TZ)
+    now=int(end.timestamp())
+    monkeypatch.setattr(runtime.time,"time",lambda:now)
+    monkeypatch.setattr(runtime,"collect_writer_checkpoint",
+                        lambda *args,**kwargs:(_ for _ in ()).throw(
+                            AssertionError("Dashboard ranking must not query Recorder")))
+    runtime.er.async_get=lambda hass:types.SimpleNamespace(async_get=lambda entity_id:
+        types.SimpleNamespace(platform=("alpha" if int(entity_id.rsplit("_",1)[1])%2==0
+                                        else "beta")))
+    hass=StrictHass(tmp_path);entry=Entry(options={
+        "enable_recorder_writer_diagnostics":True})
+    monitor=runtime.StorageMonitor(hass,entry)
+    monitor.db.initialize();monitor.writer_diagnostics_enabled=True
+    counts={f"sensor.writer_{index:03d}":1000-index for index in range(520)}
+    for i in range(32):
+        checkpoint=end-timedelta(hours=6*i)
+        start_ts,end_ts=runtime.local_checkpoint_window(checkpoint)
+        monitor.db.save_writer_window({"start_ts":start_ts,"end_ts":end_ts,
+            "status":"ok","reason":"","total_rows":sum(counts.values()),
+            "counts":counts})
+
+    page1=_run(monitor.writer_ranking(20,1))
+    assert len(page1["entities"])==20 and page1["total_pages"]==1
+    assert page1["entities"][0]["entity_id"]=="sensor.writer_000"
+    assert sum(group["entities_in_selected"]
+               for group in page1["grouped_by_integration"])==20
+
+    page2=_run(monitor.writer_ranking(100,2))
+    assert len(page2["entities"])==50 and page2["total_pages"]==2
+    assert page2["entities"][0]["entity_id"]=="sensor.writer_050"
+    assert sum(group["entities_in_selected"]
+               for group in page2["grouped_by_integration"])==100
+    assert sum(group["rows_6h"] for group in page2["grouped_by_integration"])==sum(
+        counts[f"sensor.writer_{index:03d}"] for index in range(100))
+    assert sum(group["rows_24h"] for group in page2["grouped_by_integration"])==4*sum(
+        counts[f"sensor.writer_{index:03d}"] for index in range(100))
+
+    page10=_run(monitor.writer_ranking(500,10))
+    assert len(page10["entities"])==50 and page10["total_pages"]==10
+    assert page10["entities"][0]["entity_id"]=="sensor.writer_450"
+    assert page10["entities"][-1]["entity_id"]=="sensor.writer_499"
+    assert sum(group["entities_in_selected"]
+               for group in page10["grouped_by_integration"])==500
+
+    dashboard_summary=_run(monitor.summary())
+    assert dashboard_summary["writers"]["entities"]==[]
+    assert dashboard_summary["writers"]["selected_limit"]==20
+
+    connection=types.SimpleNamespace(
+        results=[],errors=[],
+        send_result=lambda ident,result:connection.results.append((ident,result)),
+        send_error=lambda *args:connection.errors.append(args))
+    hass.data[runtime.DOMAIN]={entry.entry_id:monitor}
+    _run(runtime.ws_writers(hass,connection,{"id":11,"limit":50,"page":1}))
+    assert len(connection.results[0][1]["entities"])==50
+    _run(runtime.ws_writers(hass,connection,{"id":12,"limit":20,"page":2}))
+    assert connection.errors[-1][1]=="invalid_ranking_request"
+    _run(runtime.ws_writers(hass,connection,{"id":13,"limit":30,"page":1}))
+    assert connection.errors[-1][1]=="invalid_ranking_request"
+    assert all(getattr(target,"__name__","")!="collect_writer_checkpoint"
+               for target,args in hass.executor_calls)
 
 
 def test_disk_low_cooldown_persists_before_failed_notification(
