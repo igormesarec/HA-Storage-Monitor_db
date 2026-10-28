@@ -1,6 +1,6 @@
 """Independent Storage Monitor: local hourly metadata, never changes production DBs."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import partial
 import logging
 from pathlib import Path
@@ -21,6 +21,81 @@ from .writers import collect_writer_checkpoint, disabled_writer_summary, local_c
 
 _LOGGER = logging.getLogger(__name__)
 TZ = ZoneInfo("Europe/Ljubljana")
+
+
+def next_influx_probe_opportunity(last_attempt_at: int | None, now: int) -> int | None:
+    """Return the next local checkpoint that also satisfies six elapsed hours."""
+    reference = int(last_attempt_at) if last_attempt_at is not None else int(now)
+    local = datetime.fromtimestamp(reference,TZ)
+    for day_offset in range(4):
+        day = local.date() + timedelta(days=day_offset)
+        for checkpoint_hour in ALARM_HOURS:
+            candidate = datetime(day.year,day.month,day.day,checkpoint_hour,tzinfo=TZ)
+            timestamp = int(candidate.timestamp())
+            if last_attempt_at is None:
+                if timestamp >= int(now):
+                    return timestamp
+            elif timestamp > int(last_attempt_at) and timestamp-int(last_attempt_at) >= 6*HOUR:
+                return timestamp
+    return None
+
+
+def influx_measurement_health(state: dict, item, now: int) -> dict:
+    """Evaluate six-hour probe health independently of hourly cache age."""
+    success=state.get("last_success") or {}
+    outcome=state.get("last_attempt_outcome") or {}
+    attempted_at=state.get("last_attempt_at")
+    measured_at=success.get("measured_at")
+    interruption=state.get("last_interruption") or {}
+    next_eligible=next_influx_probe_opportunity(attempted_at,now)
+    failures=int(state.get("consecutive_failures") or 0)
+    overdue=bool(attempted_at is not None and next_eligible is not None
+                 and int(now)>=int(next_eligible)+HOUR)
+    item_status=(item.get("status") if isinstance(item,dict)
+                 else getattr(item,"status",None))
+    if failures>=2:
+        status="prolonged_unavailable"
+        reason=f"{failures} consecutive eligible Supervisor probes failed"
+    elif overdue:
+        status="prolonged_unavailable"
+        reason="An eligible scheduled Supervisor probe opportunity is overdue"
+    elif outcome.get("status")=="interrupted":
+        status="probe_interrupted"
+        reason=("Last eligible Supervisor probe was interrupted; waiting for "
+                "the next scheduled opportunity")
+    elif outcome.get("status")=="failure":
+        status="probe_failed"
+        reason="Last eligible Supervisor probe failed; waiting for the next scheduled opportunity"
+    elif outcome.get("status")=="in_progress":
+        status="probe_in_progress"
+        reason="An eligible Supervisor probe is currently in progress"
+    elif item_status=="ok":
+        status="fresh"
+        reason="Fresh Supervisor measurement"
+    elif item_status=="cached":
+        status="cached"
+        reason="Waiting for next eligible Supervisor probe"
+    elif item_status=="stale" and success:
+        status="stale_waiting"
+        reason="Stale historical measurement; waiting for next eligible Supervisor probe"
+    else:
+        status="unavailable"
+        reason="No verified InfluxDB add-on size measurement is available"
+    return {
+        "status":status,
+        "reason":reason,
+        "should_alert":failures>=2 or overdue,
+        "consecutive_failures":failures,
+        "last_success_at":measured_at,
+        "last_attempt_at":attempted_at,
+        "last_attempt_status":outcome.get("status") or "unknown",
+        "last_attempt_detail":outcome.get("detail") or "No durable probe outcome recorded",
+        "last_interrupted_at":interruption.get("attempted_at"),
+        "interruption_detected_at":interruption.get("detected_at"),
+        "measurement_age_seconds":(max(0,int(now)-int(measured_at))
+                                   if measured_at is not None else None),
+        "next_eligible_at":next_eligible,
+    }
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register commands before a config entry loads, no production changes."""
@@ -92,24 +167,42 @@ class StorageMonitor:
                 fetch_influx=await self.hass.async_add_executor_job(
                     self.db.reserve_influx_probe,now,6*HOUR)
             probe_state=await self.hass.async_add_executor_job(
-                self.db.influx_probe_state)
+                self.db.influx_probe_state,now)
             if fetch_influx:
-                usage=await get_influx_usage(async_get_clientsession(self.hass),DEFAULT_INFLUX_SLUG)
-                current=Sample(hour,"influx_addon",usage.size,usage.status,
-                               "supervisor_addons_data_total",now if usage.status=="ok" else None,
-                               detail=usage.detail)
+                try:
+                    usage=await get_influx_usage(
+                        async_get_clientsession(self.hass),DEFAULT_INFLUX_SLUG)
+                    current=Sample(hour,"influx_addon",usage.size,usage.status,
+                                   "supervisor_addons_data_total",
+                                   now if usage.status=="ok" else None,
+                                   detail=usage.detail)
+                except Exception as err:
+                    current=Sample(hour,"influx_addon",None,"unavailable",
+                                   "supervisor_addons_data_total",None,
+                                   detail=f"Supervisor probe failed: {type(err).__name__}")
                 samples.append(current)
-                if current.status=="ok":
-                    await self.hass.async_add_executor_job(
-                        self.db.save_influx_success,current)
+                await self.hass.async_add_executor_job(
+                    self.db.save_influx_result,now,current)
             else:
                 cached=probe_state["last_success"]
                 if cached:
                     age=max(0,now-int(cached["measured_at"]))
                     status="cached" if age < 7*HOUR else "stale"
-                    reason=("Six-hour safety minimum deferred this requested probe"
-                            if requested_influx else
-                            "Previously measured; not a fresh hourly read")
+                    outcome=probe_state.get("last_attempt_outcome") or {}
+                    if outcome.get("status")=="interrupted":
+                        reason=("Last eligible Supervisor probe was interrupted; "
+                                "showing only the previous verified historical size")
+                    elif outcome.get("status")=="failure":
+                        reason=("Last eligible Supervisor probe failed; showing only "
+                                "the previous verified historical size")
+                    elif outcome.get("status")=="in_progress":
+                        reason=("Supervisor probe is in progress; showing the previous "
+                                "verified historical size until it completes")
+                    elif requested_influx:
+                        reason=("Waiting for next eligible Supervisor probe; "
+                                "six-hour safety minimum has not elapsed")
+                    else:
+                        reason="Waiting for next eligible Supervisor probe"
                     samples.append(Sample(
                         hour,"influx_addon",int(cached["size"]),status,
                         str(cached.get("method") or "supervisor_addons_data_total"),
@@ -232,17 +325,16 @@ class StorageMonitor:
                                   window=prev["last_window"],now=hour)
 
     async def check_stale(self,samples: list[Sample],hour: int,local_now: datetime):
-        # Two missing consecutive hourly observations. Cached Influx is only
-        # temporarily accepted if its last verified age is <=7 hours.
-        keys={"recorder_total","disk_free","influx_addon"}
+        # Keep the two-consecutive-hour rule only for genuinely hourly sources.
+        # InfluxDB has a separate attempt-aware six-hour health policy below.
+        keys={"recorder_total","disk_free"}
         keys.update(s.source for s in samples if s.source.startswith("database:"))
         bykey={s.source:s for s in samples}
         window=f"{local_now.date().isoformat()}:{(local_now.hour//6)*6:02d}"
         for key in keys:
             item=bykey.get(key)
             if not item: continue
-            fresh=(item.status=="ok" or (key=="influx_addon" and item.status=="cached"
-                    and item.measured_at is not None and hour-item.measured_at < 7*HOUR))
+            fresh=item.status=="ok"
             previous=await self.hass.async_add_executor_job(self.db.get_alert,"stale:"+key)
             last=await self.hass.async_add_executor_job(self.db.last_two,key)
             stale=(not fresh and len(last)==2 and last[0]["hour"]-last[1]["hour"]==HOUR
@@ -260,6 +352,47 @@ class StorageMonitor:
                 if not notify:
                     await self._set_alert("stale:"+key,active=stale,
                                           window=previous["last_window"],now=hour)
+        influx=bykey.get("influx_addon")
+        if influx is not None:
+            await self.check_influx_health(influx,hour,local_now)
+
+    async def check_influx_health(self,item: Sample,hour: int,local_now: datetime):
+        """Alert on failed/overdue probe opportunities, never cache aging alone."""
+        state=await self.hass.async_add_executor_job(
+            self.db.influx_probe_state,int(local_now.timestamp()))
+        now=int(local_now.timestamp())
+        health=influx_measurement_health(state,item,now)
+        key="stale:influx_addon"
+        previous=await self.hass.async_add_executor_job(self.db.get_alert,key)
+        outcome=health["last_attempt_status"]
+        active=bool(health["should_alert"] or (
+            previous["active"] and health["consecutive_failures"]>0
+            and outcome!="success"))
+        window=f"{local_now.date().isoformat()}:{(local_now.hour//6)*6:02d}"
+        notify=active and allow_notification(previous,window,hour) and (
+            not previous["active"] or bool(self.options.get("repeat_notifications",False)))
+        if notify:
+            await self._set_alert(key,active=True,window=window,now=hour,notified=True)
+            success=(datetime.fromtimestamp(health["last_success_at"],TZ).isoformat()
+                     if health["last_success_at"] is not None else "Unavailable")
+            attempted=(datetime.fromtimestamp(health["last_attempt_at"],TZ).isoformat()
+                       if health["last_attempt_at"] is not None else "Unavailable")
+            next_probe=(datetime.fromtimestamp(health["next_eligible_at"],TZ).isoformat()
+                        if health["next_eligible_at"] is not None else "Undetermined")
+            age=(f"{health['measurement_age_seconds']/HOUR:.1f} hours"
+                 if health["measurement_age_seconds"] is not None else "Unknown")
+            await self._notify_safely(
+                "stale_influx_addon","InfluxDB add-on size measurement unavailable",
+                f"Storage Monitor cannot currently verify the InfluxDB add-on disk usage. "
+                f"Last successful measurement: {success}. Last attempted probe: {attempted} "
+                f"({outcome}: {health['last_attempt_detail']}). Measurement age: {age}. "
+                f"Reason: {health['reason']}. Next eligible probe opportunity: {next_probe}. "
+                "This reports measurement availability, not whether the InfluxDB service is running.")
+        elif active:
+            await self._set_alert(key,active=True,window=previous["last_window"],now=hour)
+        elif previous["active"]:
+            await self._set_alert(key,active=False,window=previous["last_window"],now=hour)
+            await self._dismiss_safely("stale_influx_addon")
 
     async def _set_alert(self,source: str,*,active: bool,window: str | None,
                          now: int,notified: bool=False):
@@ -279,6 +412,16 @@ class StorageMonitor:
         except Exception:
             _LOGGER.exception(
                 "Storage Monitor notification delivery failed; cooldown persisted")
+
+    async def _dismiss_safely(self,ident):
+        """Dismiss only this integration's own resolved persistent notification."""
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification","dismiss",
+                {"notification_id":"ha_storage_monitor_"+ident.replace(":","_")},
+                blocking=False)
+        except Exception:
+            _LOGGER.exception("Storage Monitor resolved notification dismissal failed")
 
     async def summary(self):
         now=utc_hour(int(time.time()))
@@ -302,6 +445,17 @@ class StorageMonitor:
         alerts["disk_low"]=await self.hass.async_add_executor_job(self.db.get_alert,"disk_low")
         for key in keys:
             alerts["stale:"+key]=await self.hass.async_add_executor_job(self.db.get_alert,"stale:"+key)
+        influx_item=next((item for item in items if item["source"]=="influx_addon"),None)
+        health_now=int(time.time())
+        influx_state=await self.hass.async_add_executor_job(
+            self.db.influx_probe_state,health_now)
+        influx_health=(influx_measurement_health(influx_state,influx_item,health_now)
+                       if influx_item is not None else None)
+        if influx_health is not None:
+            influx_health["alert_active"]=bool(
+                alerts.get("stale:influx_addon",{}).get("active"))
+            if influx_health["alert_active"]:
+                influx_health["status"]="prolonged_unavailable"
         # One-hour history is in OUR sqlite, independent of HA Recorder retention.
         changes={}
         for key in keys:
@@ -338,6 +492,7 @@ class StorageMonitor:
         writers["top20_grouped_by_integration"]=sorted(
             grouped.values(),key=lambda r:-(r["rows_24h"] if r["rows_24h"] is not None else r["rows_6h"]))
         return {"samples":items,"alerts":alerts,"growth":growth,"writers":writers,
+                "influx_health":influx_health,
                 "now":int(time.time()),"timezone":"Europe/Ljubljana","changes":changes,
                 "writer_diagnostics_enabled":self.writer_diagnostics_enabled,
                 "effective_options":{

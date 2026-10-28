@@ -14,6 +14,7 @@ from typing import Iterable
 
 HOUR = 3600
 DAY = 86400
+INFLUX_PROBE_ABANDONED_AFTER = 2 * 60
 
 @dataclass(frozen=True)
 class Sample:
@@ -175,6 +176,12 @@ class SnapshotDB:
         now = int(now)
         with _raw_connection(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
+            # Reconcile an older unfinished reservation before considering a
+            # new one.  This is especially important after a long HA outage:
+            # otherwise each new reservation could overwrite the only proof
+            # that the preceding Supervisor request was interrupted.
+            self._reconcile_influx_interruption(
+                db, now, INFLUX_PROBE_ABANDONED_AFTER)
             row = db.execute(
                 "SELECT value FROM metadata WHERE key='influx_last_attempt_at'"
             ).fetchone()
@@ -190,32 +197,142 @@ class SnapshotDB:
                 VALUES('influx_last_attempt_at',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                 (str(now),))
+            outcome = json.dumps({
+                "attempted_at": now,
+                "status": "in_progress",
+                "detail": "Supervisor probe reserved; outcome not yet recorded",
+            }, separators=(",", ":"))
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('influx_last_attempt_outcome',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (outcome,))
             return True
 
-    def save_influx_success(self, sample: Sample):
-        """Persist the last genuine Supervisor result for safe cache reuse."""
-        if (sample.source != "influx_addon" or sample.status != "ok"
-                or sample.size is None or sample.measured_at is None):
-            raise ValueError("Only a genuine InfluxDB measurement can be cached")
-        value = json.dumps({
-            "size": int(sample.size),
-            "measured_at": int(sample.measured_at),
-            "method": sample.method,
-            "allocated": sample.allocated,
-            "detail": sample.detail,
-        }, separators=(",", ":"))
-        with _raw_connection(self.path) as db:
-            db.execute("""INSERT INTO metadata(key,value)
-                VALUES('influx_last_success',?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (value,))
+    @staticmethod
+    def _reconcile_influx_interruption(db, now: int,
+                                       abandoned_after: int) -> bool:
+        """Durably finish an abandoned reservation as ``interrupted``.
 
-    def influx_probe_state(self) -> dict:
-        """Return durable attempt and success state, tolerating old archives."""
+        A two-minute grace exceeds the Supervisor HTTP client's 65-second
+        total timeout.  Recent reservations therefore remain ``in_progress``
+        during a legitimate request or an immediate Home Assistant restart.
+        """
+        row = db.execute("""SELECT value FROM metadata
+            WHERE key='influx_last_attempt_outcome'""").fetchone()
+        if row is None:
+            return False
+        try:
+            outcome = json.loads(row[0])
+            attempted_at = int(outcome["attempted_at"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if (not isinstance(outcome, dict)
+                or outcome.get("status") != "in_progress"
+                or int(now) - attempted_at < int(abandoned_after)):
+            return False
+        failure_row = db.execute("""SELECT value FROM metadata
+            WHERE key='influx_consecutive_failures'""").fetchone()
+        try:
+            failures = max(0, int(failure_row[0])) if failure_row else 0
+        except (TypeError, ValueError):
+            failures = 0
+        detail = ("Supervisor probe was interrupted before an outcome was "
+                  "recorded; no new measurement was accepted")
+        interrupted = {
+            "attempted_at": attempted_at,
+            "status": "interrupted",
+            "detail": detail,
+            "detected_at": int(now),
+        }
+        encoded = json.dumps(interrupted, separators=(",", ":"))
+        db.execute("""INSERT INTO metadata(key,value)
+            VALUES('influx_last_attempt_outcome',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (encoded,))
+        db.execute("""INSERT INTO metadata(key,value)
+            VALUES('influx_last_interruption',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (encoded,))
+        db.execute("""INSERT INTO metadata(key,value)
+            VALUES('influx_consecutive_failures',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (str(failures + 1),))
+        return True
+
+    def save_influx_result(self, attempted_at: int, sample: Sample):
+        """Persist an eligible probe outcome and consecutive-failure state."""
+        if sample.source != "influx_addon" or sample.status not in ("ok", "unavailable"):
+            raise ValueError("Invalid InfluxDB probe result")
+        if sample.status == "ok" and (sample.size is None or sample.measured_at is None):
+            raise ValueError("A successful probe requires a genuine measurement")
+        attempted_at = int(attempted_at)
         with _raw_connection(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            outcome_row = db.execute("""SELECT value FROM metadata
+                WHERE key='influx_last_attempt_outcome'""").fetchone()
+            current_outcome = None
+            if outcome_row is not None:
+                try:
+                    parsed = json.loads(outcome_row[0])
+                    if isinstance(parsed, dict):
+                        current_outcome = parsed
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            row = db.execute("""SELECT value FROM metadata
+                WHERE key='influx_consecutive_failures'""").fetchone()
+            try:
+                previous_failures = max(0, int(row[0])) if row else 0
+            except (TypeError, ValueError):
+                previous_failures = 0
+            success = sample.status == "ok"
+            already_counted = bool(
+                current_outcome
+                and current_outcome.get("attempted_at") == attempted_at
+                and current_outcome.get("status") in ("failure", "interrupted"))
+            failures = (0 if success else previous_failures if already_counted
+                        else previous_failures + 1)
+            outcome = json.dumps({
+                "attempted_at": attempted_at,
+                "status": "success" if success else "failure",
+                "detail": str(sample.detail)[:300],
+            }, separators=(",", ":"))
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('influx_last_attempt_outcome',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (outcome,))
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('influx_consecutive_failures',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (str(failures),))
+            if success:
+                value = json.dumps({
+                    "size": int(sample.size),
+                    "measured_at": int(sample.measured_at),
+                    "method": sample.method,
+                    "allocated": sample.allocated,
+                    "detail": sample.detail,
+                }, separators=(",", ":"))
+                db.execute("""INSERT INTO metadata(key,value)
+                    VALUES('influx_last_success',?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (value,))
+
+    def save_influx_success(self, sample: Sample):
+        """Compatibility wrapper for a genuine successful probe."""
+        self.save_influx_result(int(sample.measured_at or sample.hour), sample)
+
+    def influx_probe_state(self, now: int | None = None,
+                           abandoned_after: int = INFLUX_PROBE_ABANDONED_AFTER) -> dict:
+        """Return durable state and optionally reconcile an abandoned probe."""
+        with _raw_connection(self.path) as db:
+            if now is not None:
+                db.execute("BEGIN IMMEDIATE")
+                self._reconcile_influx_interruption(
+                    db, int(now), int(abandoned_after))
             rows = dict(db.execute("""SELECT key,value FROM metadata
-                WHERE key IN ('influx_last_attempt_at','influx_last_success')""").fetchall())
+                WHERE key IN ('influx_last_attempt_at','influx_last_success',
+                              'influx_last_attempt_outcome','influx_consecutive_failures',
+                              'influx_last_interruption')""").fetchall())
         attempt = None
         success = None
+        outcome = None
+        interruption = None
+        failures = 0
         try:
             attempt = int(rows["influx_last_attempt_at"])
         except (KeyError, TypeError, ValueError):
@@ -227,7 +344,32 @@ class SnapshotDB:
                 success = parsed
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             pass
-        return {"last_attempt_at": attempt, "last_success": success}
+        try:
+            parsed = json.loads(rows["influx_last_attempt_outcome"])
+            if (isinstance(parsed, dict)
+                    and parsed.get("status") in
+                        ("in_progress", "success", "failure", "interrupted")
+                    and isinstance(parsed.get("attempted_at"), int)):
+                outcome = parsed
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        try:
+            parsed = json.loads(rows["influx_last_interruption"])
+            if (isinstance(parsed, dict)
+                    and parsed.get("status") == "interrupted"
+                    and isinstance(parsed.get("attempted_at"), int)
+                    and isinstance(parsed.get("detected_at"), int)):
+                interruption = parsed
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        try:
+            failures = max(0, int(rows.get("influx_consecutive_failures", "0")))
+        except (TypeError, ValueError):
+            failures = 0
+        return {"last_attempt_at": attempt, "last_success": success,
+                "last_attempt_outcome": outcome,
+                "last_interruption": interruption,
+                "consecutive_failures": failures}
 
     def latest(self):
         with _raw_connection(self.path) as db:

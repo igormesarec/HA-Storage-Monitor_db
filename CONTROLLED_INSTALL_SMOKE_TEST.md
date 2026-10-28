@@ -5,7 +5,7 @@ This checklist is documentation only. Installation, file copying and the require
 ## Initial installation: writer diagnostics off
 
 1. Confirm an ordinary Home Assistant backup exists using the owner's established process.
-2. Install or update **Home Assistant Storage Monitor `0.2.0-beta.1`** through HACS (or copy only `custom_components/ha_storage_monitor` into the corresponding `/config/custom_components` directory). Downloading files does not activate new Python or JavaScript code.
+2. Install or update **Home Assistant Storage Monitor `0.2.1-beta.1`** through HACS (or copy only `custom_components/ha_storage_monitor` into the corresponding `/config/custom_components` directory). Downloading files does not activate new Python or JavaScript code.
 3. After separate owner approval, perform one controlled Home Assistant Core restart. A config-entry reload alone does not import upgraded custom-component Python.
 4. For a new installation, add **Home Assistant Storage Monitor** from Settings > Devices & Services. For an update, confirm the existing config entry and `.storage/ha_storage_monitor_history.sqlite3` remain in place; do not delete or recreate them.
 5. Leave **Enable bounded Recorder writer diagnostics** off. It defaults to off.
@@ -18,6 +18,9 @@ This checklist is documentation only. Installation, file copying and the require
    - `/config` disk total/free/used scope;
    - InfluxDB add-on total only when HA Core receives an authorized exact Supervisor subtree, otherwise `Unavailable`;
    - after a quick restart, the Supervisor scan is not repeated inside six elapsed hours; cached values retain the original successful timestamp and stale/unavailable states remain explicit;
+   - a stale cached Influx value awaiting its next eligible checkpoint does not create a false hourly-miss notification;
+   - an eligible Supervisor failure is shown separately from an expected deferral; two consecutive eligible failures (or an eligible checkpoint overdue by one hour) activate the Influx measurement-health alert;
+   - an interrupted attempt is shown separately from an HTTP failure after its two-minute completion grace; an immediate restart still shows it as in progress and does not repeat the Supervisor scan;
    - generic nonrecursive local SQLite discovery;
    - hourly history and growth state (`learning` until genuine history exists);
    - independent disk-low and stale-data status.
@@ -25,6 +28,7 @@ This checklist is documentation only. Installation, file copying and the require
 11. Open all seven internal tabs: Overview, Databases, Charts, Top Writers, Disk Usage, Alerts and Settings. Confirm unavailable values are not shown as zero and long database filenames can be inspected by hovering or focusing their truncated labels.
     In Databases, verify the optional existing SQL sensor cross-check uses the already configured entity only. A missing or unavailable entity must be explained, never displayed as zero; no new SQL integration or polling is authorized.
 12. On Charts, check 1/7/30/90-day controls, exact Min/Max/Range/Net MiB values, visible gaps, and the measured-sample count. Cached Influx values must be excluded from the plotted measurements.
+    On the Influx card and Alerts page, verify the displayed last success, last attempt outcome, age and next eligible checkpoint. The text must describe measurement availability and must not claim that InfluxDB itself stopped.
 13. On Disk Usage, confirm Total, Used and Available are labeled as `/config` filesystem values. Any `total − used − available` difference is explanatory Linux filesystem accounting, not a newly measured storage category.
 
 ## Later optional writer-diagnostics opt-in
