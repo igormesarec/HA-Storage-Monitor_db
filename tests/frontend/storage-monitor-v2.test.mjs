@@ -238,3 +238,43 @@ test('existing SQL sensor cross-check is read-only and never substitutes zero',(
   assert.doesNotMatch(card.shadowRoot.textContent,/Existing SQL sensor cross-check/);
   dom.window.close();
 });
+
+test('Influx card and Alerts distinguish cache age from probe failures',()=>{
+  const data=summary({
+    alerts:{disk_low:{active:0},'stale:influx_addon':{active:0,acknowledged_until:0}},
+    influx_health:{status:'cached',reason:'Waiting for next eligible Supervisor probe',alert_active:false,last_success_at:NOW-6*3600,last_attempt_at:NOW-6*3600,last_attempt_status:'success',last_attempt_detail:'verified',measurement_age_seconds:6*3600,next_eligible_at:NOW+3600},
+  });
+  const influx=data.samples.find(row=>row.source==='influx_addon');
+  influx.size=7*GIB;influx.status='cached';influx.measured_at=NOW-6*3600;
+  const {dom,card}=cardWith(data);
+  card._tab='databases';card.render();
+  data.influx_health={...data.influx_health,status:'fresh',reason:'Fresh Supervisor measurement'};
+  influx.status='ok';card.render();
+  assert.match(card.shadowRoot.textContent,/Fresh measurement/);
+  data.influx_health={...data.influx_health,status:'cached',reason:'Waiting for next eligible Supervisor probe'};
+  influx.status='cached';card.render();
+  assert.match(card.shadowRoot.textContent,/Cached measurement/);
+  assert.match(card.shadowRoot.textContent,/Waiting for next eligible Supervisor probe/);
+  data.influx_health={...data.influx_health,status:'stale_waiting',reason:'Stale historical measurement; waiting for next eligible Supervisor probe',measurement_age_seconds:8*3600};
+  influx.status='stale';card.render();
+  assert.match(card.shadowRoot.textContent,/Stale — awaiting eligible probe/);
+  data.influx_health={...data.influx_health,status:'probe_failed',reason:'Last eligible Supervisor probe failed; waiting for the next scheduled opportunity',last_attempt_status:'failure',last_attempt_detail:'Supervisor HTTP 403'};
+  card.render();assert.match(card.shadowRoot.textContent,/Eligible probe failed/);
+  data.influx_health={...data.influx_health,status:'prolonged_unavailable',reason:'2 consecutive eligible Supervisor probes failed',alert_active:true};
+  data.alerts['stale:influx_addon'].active=1;
+  card._tab='alerts';card.render();
+  assert.match(card.shadowRoot.textContent,/Prolonged measurement unavailability/);
+  assert.match(card.shadowRoot.textContent,/This is measurement health, not proof that the InfluxDB service stopped/);
+  assert.match(card.shadowRoot.textContent,/Supervisor HTTP 403/);
+  data.influx_health={...data.influx_health,status:'unavailable',reason:'No verified InfluxDB add-on size measurement is available',alert_active:false,last_success_at:null,measurement_age_seconds:null};
+  data.alerts['stale:influx_addon'].active=0;
+  influx.size=null;influx.status='unavailable';card._tab='databases';card.render();
+  assert.match(card.shadowRoot.textContent,/Measurement unavailable/);
+  card._language='sl';card.render();
+  assert.match(card.shadowRoot.textContent,/Meritev ni na voljo/);
+  data.influx_health={...data.influx_health,status:'prolonged_unavailable',reason:'2 consecutive eligible Supervisor probes failed',alert_active:true,last_success_at:NOW-8*3600,measurement_age_seconds:8*3600};
+  data.alerts['stale:influx_addon'].active=1;card._tab='alerts';card.render();
+  assert.match(card.shadowRoot.textContent,/Dolgotrajna nedostopnost meritve/);
+  assert.match(card.shadowRoot.textContent,/To je stanje meritve/);
+  dom.window.close();
+});

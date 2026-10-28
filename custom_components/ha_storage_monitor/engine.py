@@ -190,32 +190,71 @@ class SnapshotDB:
                 VALUES('influx_last_attempt_at',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                 (str(now),))
+            outcome = json.dumps({
+                "attempted_at": now,
+                "status": "in_progress",
+                "detail": "Supervisor probe reserved; outcome not yet recorded",
+            }, separators=(",", ":"))
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('influx_last_attempt_outcome',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (outcome,))
             return True
 
-    def save_influx_success(self, sample: Sample):
-        """Persist the last genuine Supervisor result for safe cache reuse."""
-        if (sample.source != "influx_addon" or sample.status != "ok"
-                or sample.size is None or sample.measured_at is None):
-            raise ValueError("Only a genuine InfluxDB measurement can be cached")
-        value = json.dumps({
-            "size": int(sample.size),
-            "measured_at": int(sample.measured_at),
-            "method": sample.method,
-            "allocated": sample.allocated,
-            "detail": sample.detail,
-        }, separators=(",", ":"))
+    def save_influx_result(self, attempted_at: int, sample: Sample):
+        """Persist an eligible probe outcome and consecutive-failure state."""
+        if sample.source != "influx_addon" or sample.status not in ("ok", "unavailable"):
+            raise ValueError("Invalid InfluxDB probe result")
+        if sample.status == "ok" and (sample.size is None or sample.measured_at is None):
+            raise ValueError("A successful probe requires a genuine measurement")
+        attempted_at = int(attempted_at)
         with _raw_connection(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT value FROM metadata
+                WHERE key='influx_consecutive_failures'""").fetchone()
+            try:
+                previous_failures = max(0, int(row[0])) if row else 0
+            except (TypeError, ValueError):
+                previous_failures = 0
+            success = sample.status == "ok"
+            failures = 0 if success else previous_failures + 1
+            outcome = json.dumps({
+                "attempted_at": attempted_at,
+                "status": "success" if success else "failure",
+                "detail": str(sample.detail)[:300],
+            }, separators=(",", ":"))
             db.execute("""INSERT INTO metadata(key,value)
-                VALUES('influx_last_success',?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (value,))
+                VALUES('influx_last_attempt_outcome',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (outcome,))
+            db.execute("""INSERT INTO metadata(key,value)
+                VALUES('influx_consecutive_failures',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (str(failures),))
+            if success:
+                value = json.dumps({
+                    "size": int(sample.size),
+                    "measured_at": int(sample.measured_at),
+                    "method": sample.method,
+                    "allocated": sample.allocated,
+                    "detail": sample.detail,
+                }, separators=(",", ":"))
+                db.execute("""INSERT INTO metadata(key,value)
+                    VALUES('influx_last_success',?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (value,))
+
+    def save_influx_success(self, sample: Sample):
+        """Compatibility wrapper for a genuine successful probe."""
+        self.save_influx_result(int(sample.measured_at or sample.hour), sample)
 
     def influx_probe_state(self) -> dict:
         """Return durable attempt and success state, tolerating old archives."""
         with _raw_connection(self.path) as db:
             rows = dict(db.execute("""SELECT key,value FROM metadata
-                WHERE key IN ('influx_last_attempt_at','influx_last_success')""").fetchall())
+                WHERE key IN ('influx_last_attempt_at','influx_last_success',
+                              'influx_last_attempt_outcome','influx_consecutive_failures')""").fetchall())
         attempt = None
         success = None
+        outcome = None
+        failures = 0
         try:
             attempt = int(rows["influx_last_attempt_at"])
         except (KeyError, TypeError, ValueError):
@@ -227,7 +266,21 @@ class SnapshotDB:
                 success = parsed
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             pass
-        return {"last_attempt_at": attempt, "last_success": success}
+        try:
+            parsed = json.loads(rows["influx_last_attempt_outcome"])
+            if (isinstance(parsed, dict)
+                    and parsed.get("status") in ("in_progress", "success", "failure")
+                    and isinstance(parsed.get("attempted_at"), int)):
+                outcome = parsed
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        try:
+            failures = max(0, int(rows.get("influx_consecutive_failures", "0")))
+        except (TypeError, ValueError):
+            failures = 0
+        return {"last_attempt_at": attempt, "last_success": success,
+                "last_attempt_outcome": outcome,
+                "consecutive_failures": failures}
 
     def latest(self):
         with _raw_connection(self.path) as db:

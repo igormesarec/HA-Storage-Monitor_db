@@ -235,7 +235,9 @@ def test_beta3_influx_snapshot_seeds_upgrade_metadata_and_restart(tmp_path):
 
 def test_fresh_install_without_influx_history_allows_first_probe(tmp_path):
     db=SnapshotDB(tmp_path/'fresh.sqlite3');db.initialize()
-    assert db.influx_probe_state()=={'last_attempt_at':None,'last_success':None}
+    assert db.influx_probe_state()=={
+        'last_attempt_at':None,'last_success':None,
+        'last_attempt_outcome':None,'consecutive_failures':0}
     assert db.reserve_influx_probe(T)
 
 
@@ -250,3 +252,27 @@ def test_beta3_unavailable_snapshot_uses_conservative_attempt_fallback(tmp_path)
     assert state['last_attempt_at']==T-1
     assert not upgraded.reserve_influx_probe(T+5*HOUR-2)
     assert upgraded.reserve_influx_probe(T+6*HOUR-1)
+
+
+def test_influx_probe_outcomes_and_failure_count_are_durable(tmp_path):
+    path=tmp_path/'health.sqlite3';db=SnapshotDB(path);db.initialize()
+    assert db.reserve_influx_probe(T)
+    unavailable=Sample(T,'influx_addon',None,'unavailable',
+                       'supervisor_addons_data_total',None,detail='HTTP 403')
+    db.save_influx_result(T,unavailable)
+    state=SnapshotDB(path).influx_probe_state()
+    assert state['last_attempt_outcome']['status']=='failure'
+    assert state['last_attempt_outcome']['detail']=='HTTP 403'
+    assert state['consecutive_failures']==1
+    assert not SnapshotDB(path).reserve_influx_probe(T+HOUR)
+    assert SnapshotDB(path).reserve_influx_probe(T+6*HOUR)
+    SnapshotDB(path).save_influx_result(T+6*HOUR,unavailable)
+    assert SnapshotDB(path).influx_probe_state()['consecutive_failures']==2
+    success=Sample(T+12*HOUR,'influx_addon',456,'ok',
+                   'supervisor_addons_data_total',T+12*HOUR,detail='verified')
+    assert SnapshotDB(path).reserve_influx_probe(T+12*HOUR)
+    SnapshotDB(path).save_influx_result(T+12*HOUR,success)
+    recovered=SnapshotDB(path).influx_probe_state()
+    assert recovered['consecutive_failures']==0
+    assert recovered['last_attempt_outcome']['status']=='success'
+    assert recovered['last_success']['size']==456

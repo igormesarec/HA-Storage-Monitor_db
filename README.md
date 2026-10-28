@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.2.0-beta.1` (27 October 2026)
+**Independent prototype:** `0.2.1-beta.1` (28 October 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -35,7 +35,14 @@ Let `S(t)` be source size in bytes at an actual observed UTC hour.
 - There is an unavoidable scheduling trade-off: a startup scan at 18:34 is only 5h26 old at midnight, so the midnight target is recorded from cache (or unavailable) rather than scanned. The next safe local checkpoint is 06:00. Similarly, the spring DST 00→06 interval is five elapsed hours and is deferred; the autumn interval is seven hours and is eligible. The integration never invents or backfills the skipped checkpoint merely to preserve exact wall-clock alignment.
 - On the first upgrade from beta.3, v0.2 seeds its new probe metadata solely from existing `influx_addon` rows in Storage Monitor's own SQLite. A genuine `ok` row preserves its exact `measured_at`, size and method. If a newer legacy `unavailable` row could represent either a failed attempt or an hourly copy, the migration conservatively treats the end of that UTC snapshot hour as the possible attempt time. This one-time ambiguity can postpone the first v0.2 probe, but prevents an unsafe duplicate scan; it never queries a production database or fabricates a measurement. A fresh archive with no Influx history remains immediately eligible for its first probe.
 - Schedules: at minute zero plus ten seconds every hour; alarm evaluations at 00:00, 06:00, 12:00, 18:00 **Europe/Ljubljana**, based on local hour. Snapshots use UTC hours, preserving both 02:00 observations during autumn DST fallback.
-- Disk-low alarm is independent of warm-up and checked hourly; threshold is the larger of the configured limit (default **15 GiB**) and size of Recorder files (safe repack minimum). Missed-readings warnings use two failed consecutive hour snapshots. Notifications use persistent notifications, idempotent durable 6h cooldown, and UI 24h acknowledgment.
+- Disk-low alarm is independent of warm-up and checked hourly; threshold is the larger of the configured limit (default **15 GiB**) and size of Recorder files (safe repack minimum). Recorder, disk and other genuinely hourly sources retain the two-consecutive-hour missing-sample rule. InfluxDB uses the cadence-aware policy below. Notifications use persistent notifications, idempotent durable 6h cooldown, and UI 24h acknowledgment.
+
+### InfluxDB measurement-health policy
+
+- An intentionally deferred request is not a failed probe. Cached values keep the original successful timestamp; after seven hours they display as stale while explicitly waiting for the next eligible local checkpoint. Cache aging alone never activates the Influx measurement alert.
+- Every eligible attempt is reserved before the Supervisor request and its outcome is saved in the monitor SQLite. A failed authorization, timeout, unavailable response or unexpected exception increments a durable consecutive-failure count. Restarting inside the six-hour minimum neither scans nor increments the count.
+- The alert activates after **two consecutive failed eligible probe attempts**, or when a scheduled eligible checkpoint remains unrecorded for one full hour. Once active, it stays active until a genuine successful probe resets the counter. A success also dismisses only Storage Monitor's own `ha_storage_monitor_stale_influx_addon` persistent notification.
+- The notification reports the exact last successful and attempted timestamps, attempt outcome, measurement age, reason and next eligible checkpoint. It says only that Storage Monitor cannot verify add-on disk usage; it does not claim that the InfluxDB service stopped.
 
 ## Installation instructions, AFTER permission to make HA changes
 
