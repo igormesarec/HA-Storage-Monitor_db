@@ -46,6 +46,7 @@ def influx_measurement_health(state: dict, item, now: int) -> dict:
     outcome=state.get("last_attempt_outcome") or {}
     attempted_at=state.get("last_attempt_at")
     measured_at=success.get("measured_at")
+    interruption=state.get("last_interruption") or {}
     next_eligible=next_influx_probe_opportunity(attempted_at,now)
     failures=int(state.get("consecutive_failures") or 0)
     overdue=bool(attempted_at is not None and next_eligible is not None
@@ -58,9 +59,16 @@ def influx_measurement_health(state: dict, item, now: int) -> dict:
     elif overdue:
         status="prolonged_unavailable"
         reason="An eligible scheduled Supervisor probe opportunity is overdue"
+    elif outcome.get("status")=="interrupted":
+        status="probe_interrupted"
+        reason=("Last eligible Supervisor probe was interrupted; waiting for "
+                "the next scheduled opportunity")
     elif outcome.get("status")=="failure":
         status="probe_failed"
         reason="Last eligible Supervisor probe failed; waiting for the next scheduled opportunity"
+    elif outcome.get("status")=="in_progress":
+        status="probe_in_progress"
+        reason="An eligible Supervisor probe is currently in progress"
     elif item_status=="ok":
         status="fresh"
         reason="Fresh Supervisor measurement"
@@ -82,6 +90,8 @@ def influx_measurement_health(state: dict, item, now: int) -> dict:
         "last_attempt_at":attempted_at,
         "last_attempt_status":outcome.get("status") or "unknown",
         "last_attempt_detail":outcome.get("detail") or "No durable probe outcome recorded",
+        "last_interrupted_at":interruption.get("attempted_at"),
+        "interruption_detected_at":interruption.get("detected_at"),
         "measurement_age_seconds":(max(0,int(now)-int(measured_at))
                                    if measured_at is not None else None),
         "next_eligible_at":next_eligible,
@@ -157,7 +167,7 @@ class StorageMonitor:
                 fetch_influx=await self.hass.async_add_executor_job(
                     self.db.reserve_influx_probe,now,6*HOUR)
             probe_state=await self.hass.async_add_executor_job(
-                self.db.influx_probe_state)
+                self.db.influx_probe_state,now)
             if fetch_influx:
                 try:
                     usage=await get_influx_usage(
@@ -179,9 +189,15 @@ class StorageMonitor:
                     age=max(0,now-int(cached["measured_at"]))
                     status="cached" if age < 7*HOUR else "stale"
                     outcome=probe_state.get("last_attempt_outcome") or {}
-                    if outcome.get("status")=="failure":
+                    if outcome.get("status")=="interrupted":
+                        reason=("Last eligible Supervisor probe was interrupted; "
+                                "showing only the previous verified historical size")
+                    elif outcome.get("status")=="failure":
                         reason=("Last eligible Supervisor probe failed; showing only "
                                 "the previous verified historical size")
+                    elif outcome.get("status")=="in_progress":
+                        reason=("Supervisor probe is in progress; showing the previous "
+                                "verified historical size until it completes")
                     elif requested_influx:
                         reason=("Waiting for next eligible Supervisor probe; "
                                 "six-hour safety minimum has not elapsed")
@@ -342,7 +358,8 @@ class StorageMonitor:
 
     async def check_influx_health(self,item: Sample,hour: int,local_now: datetime):
         """Alert on failed/overdue probe opportunities, never cache aging alone."""
-        state=await self.hass.async_add_executor_job(self.db.influx_probe_state)
+        state=await self.hass.async_add_executor_job(
+            self.db.influx_probe_state,int(local_now.timestamp()))
         now=int(local_now.timestamp())
         health=influx_measurement_health(state,item,now)
         key="stale:influx_addon"
@@ -429,8 +446,10 @@ class StorageMonitor:
         for key in keys:
             alerts["stale:"+key]=await self.hass.async_add_executor_job(self.db.get_alert,"stale:"+key)
         influx_item=next((item for item in items if item["source"]=="influx_addon"),None)
-        influx_state=await self.hass.async_add_executor_job(self.db.influx_probe_state)
-        influx_health=(influx_measurement_health(influx_state,influx_item,int(time.time()))
+        health_now=int(time.time())
+        influx_state=await self.hass.async_add_executor_job(
+            self.db.influx_probe_state,health_now)
+        influx_health=(influx_measurement_health(influx_state,influx_item,health_now)
                        if influx_item is not None else None)
         if influx_health is not None:
             influx_health["alert_active"]=bool(

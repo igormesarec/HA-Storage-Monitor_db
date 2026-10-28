@@ -258,6 +258,10 @@ test('Influx card and Alerts distinguish cache age from probe failures',()=>{
   data.influx_health={...data.influx_health,status:'stale_waiting',reason:'Stale historical measurement; waiting for next eligible Supervisor probe',measurement_age_seconds:8*3600};
   influx.status='stale';card.render();
   assert.match(card.shadowRoot.textContent,/Stale — awaiting eligible probe/);
+  data.influx_health={...data.influx_health,status:'probe_in_progress',reason:'An eligible Supervisor probe is currently in progress',last_attempt_status:'in_progress'};
+  card.render();assert.match(card.shadowRoot.textContent,/Eligible probe in progress/);
+  data.influx_health={...data.influx_health,status:'probe_interrupted',reason:'Last eligible Supervisor probe was interrupted; waiting for the next scheduled opportunity',last_attempt_status:'interrupted',last_attempt_detail:'Supervisor probe was interrupted before an outcome was recorded'};
+  card.render();assert.match(card.shadowRoot.textContent,/Eligible probe interrupted/);
   data.influx_health={...data.influx_health,status:'probe_failed',reason:'Last eligible Supervisor probe failed; waiting for the next scheduled opportunity',last_attempt_status:'failure',last_attempt_detail:'Supervisor HTTP 403'};
   card.render();assert.match(card.shadowRoot.textContent,/Eligible probe failed/);
   data.influx_health={...data.influx_health,status:'prolonged_unavailable',reason:'2 consecutive eligible Supervisor probes failed',alert_active:true};
@@ -272,6 +276,9 @@ test('Influx card and Alerts distinguish cache age from probe failures',()=>{
   assert.match(card.shadowRoot.textContent,/Measurement unavailable/);
   card._language='sl';card.render();
   assert.match(card.shadowRoot.textContent,/Meritev ni na voljo/);
+  data.influx_health={...data.influx_health,status:'probe_interrupted',reason:'prekinjeno',last_attempt_status:'interrupted'};
+  card.render();
+  assert.match(card.shadowRoot.textContent,/Upravičeni preizkus je bil prekinjen/);
   data.influx_health={...data.influx_health,status:'prolonged_unavailable',reason:'2 consecutive eligible Supervisor probes failed',alert_active:true,last_success_at:NOW-8*3600,measurement_age_seconds:8*3600};
   data.alerts['stale:influx_addon'].active=1;card._tab='alerts';card.render();
   assert.match(card.shadowRoot.textContent,/Dolgotrajna nedostopnost meritve/);

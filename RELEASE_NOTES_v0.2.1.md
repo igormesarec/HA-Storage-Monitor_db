@@ -21,6 +21,13 @@ is still unrecorded one hour later, activates the measurement-health alert. A
 successful eligible probe resets the count, clears the durable alert and
 dismisses only Storage Monitor's own persistent notification.
 
+Eligible attempts are reserved durably before network I/O. If Home Assistant
+is interrupted before the result is saved, the attempt remains `in_progress`
+for a two-minute grace period and is then recorded as `interrupted`, distinct
+from an HTTP/API failure. Interrupted attempts count toward prolonged
+measurement unavailability, cannot bypass the six-elapsed-hour scan minimum,
+and never replace the last genuine measurement or its original timestamp.
+
 The alert includes last success, last attempt and outcome, measurement age,
 reason and next eligible checkpoint, and explicitly distinguishes measurement
 availability from InfluxDB service health. No extra polling is introduced.

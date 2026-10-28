@@ -20,6 +20,7 @@ This checklist is documentation only. Installation, file copying and the require
    - after a quick restart, the Supervisor scan is not repeated inside six elapsed hours; cached values retain the original successful timestamp and stale/unavailable states remain explicit;
    - a stale cached Influx value awaiting its next eligible checkpoint does not create a false hourly-miss notification;
    - an eligible Supervisor failure is shown separately from an expected deferral; two consecutive eligible failures (or an eligible checkpoint overdue by one hour) activate the Influx measurement-health alert;
+   - an interrupted attempt is shown separately from an HTTP failure after its two-minute completion grace; an immediate restart still shows it as in progress and does not repeat the Supervisor scan;
    - generic nonrecursive local SQLite discovery;
    - hourly history and growth state (`learning` until genuine history exists);
    - independent disk-low and stale-data status.

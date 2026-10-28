@@ -592,6 +592,92 @@ def test_influx_failed_opportunities_alert_once_survive_restart_and_recover(
     assert dismisses[0][2]["notification_id"]=="ha_storage_monitor_stale_influx_addon"
 
 
+def test_influx_interrupted_attempts_alert_with_cooldown_and_recover(
+        tmp_path, monkeypatch):
+    runtime=_load_runtime(monkeypatch)
+    clock=[int(datetime(2026,10,27,18,0,tzinfo=runtime.TZ).timestamp())]
+    monkeypatch.setattr(runtime.time,"time",lambda:clock[0])
+    monkeypatch.setattr(runtime,"collect_local",
+                        lambda config,hour,actual:_samples(runtime,hour))
+    probes=[]
+
+    async def successful(session,slug):
+        probes.append(clock[0])
+        return types.SimpleNamespace(size=8*GIB,status="ok",detail="recovered")
+
+    monkeypatch.setattr(runtime,"get_influx_usage",successful)
+    hass=StrictHass(tmp_path);monitor=runtime.StorageMonitor(hass,Entry())
+    monitor.db.initialize()
+    genuine=runtime.Sample(runtime.utc_hour(clock[0]),"influx_addon",7*GIB,
+                           "ok","supervisor_addons_data_total",clock[0],
+                           detail="previous genuine measurement")
+    assert monitor.db.reserve_influx_probe(clock[0])
+    monitor.db.save_influx_result(clock[0],genuine)
+    genuine_at=clock[0]
+
+    # Simulate a crash after the midnight reservation but before a result.
+    first=clock[0]+6*runtime.HOUR
+    assert monitor.db.reserve_influx_probe(first)
+    clock[0]=first+60
+    restarted=runtime.StorageMonitor(hass,Entry())
+    _run(restarted.sample(False,startup=True))
+    state=restarted.db.influx_probe_state(clock[0])
+    assert probes==[]
+    assert state["last_attempt_outcome"]["status"]=="in_progress"
+    assert state["consecutive_failures"]==0
+    assert restarted.db.get_alert("stale:influx_addon")["active"]==0
+
+    clock[0]=first+120
+    _run(restarted.sample(False))
+    state=restarted.db.influx_probe_state(clock[0])
+    assert state["last_attempt_outcome"]["status"]=="interrupted"
+    assert state["consecutive_failures"]==1
+    historical={row["source"]:row for row in restarted.db.latest()}["influx_addon"]
+    assert historical["size"]==7*GIB
+    assert historical["measured_at"]==genuine_at
+    assert "interrupted" in historical["detail"]
+
+    # A second interrupted eligible attempt must activate the same durable
+    # alert used by HTTP failures, with no extra Supervisor request.
+    second=first+6*runtime.HOUR
+    assert restarted.db.reserve_influx_probe(second)
+    clock[0]=second+120
+    _run(restarted.sample(False))
+    state=restarted.db.influx_probe_state(clock[0])
+    assert state["last_attempt_outcome"]["status"]=="interrupted"
+    assert state["consecutive_failures"]==2
+    assert probes==[]
+    alert=restarted.db.get_alert("stale:influx_addon")
+    assert alert["active"]==1
+    creates=[call for call in hass.notification_calls if call[1]=="create"
+             and call[2]["notification_id"]==
+             "ha_storage_monitor_stale_influx_addon"]
+    assert len(creates)==1
+    assert "interrupted" in creates[0][2]["message"]
+
+    # Further hourly checks are inside the durable cooldown and neither scan
+    # nor send another notification.
+    clock[0]=second+runtime.HOUR
+    _run(restarted.sample(False))
+    assert probes==[]
+    assert len([call for call in hass.notification_calls if call[1]=="create"
+                and call[2]["notification_id"]==
+                "ha_storage_monitor_stale_influx_addon"])==1
+
+    # The next eligible real success clears the alert and dismisses only this
+    # integration's own notification.
+    clock[0]=second+6*runtime.HOUR
+    _run(restarted.sample(True))
+    recovered=restarted.db.influx_probe_state(clock[0])
+    assert probes==[clock[0]]
+    assert recovered["consecutive_failures"]==0
+    assert recovered["last_attempt_outcome"]["status"]=="success"
+    assert restarted.db.get_alert("stale:influx_addon")["active"]==0
+    dismisses=[call for call in hass.notification_calls if call[1]=="dismiss"]
+    assert len(dismisses)==1
+    assert dismisses[0][2]["notification_id"]=="ha_storage_monitor_stale_influx_addon"
+
+
 def test_influx_overdue_policy_and_dst_checkpoint_selection(monkeypatch):
     runtime=_load_runtime(monkeypatch)
     success={"size":7*GIB,"measured_at":0,
@@ -606,6 +692,21 @@ def test_influx_overdue_policy_and_dst_checkpoint_selection(monkeypatch):
         autumn_attempt,autumn_attempt)
     assert autumn_next==int(datetime(2026,10,25,6,0,
                                      tzinfo=runtime.TZ).timestamp())
+    # An interrupted outcome does not alter elapsed-time checkpoint selection
+    # on either DST transition.
+    interrupted={"attempted_at":spring_attempt,"status":"interrupted",
+                 "detail":"probe interrupted","detected_at":spring_attempt+120}
+    interrupted_state={"last_attempt_at":spring_attempt,
+                       "last_success":{**success,"measured_at":spring_attempt},
+                       "last_attempt_outcome":interrupted,
+                       "last_interruption":interrupted,
+                       "consecutive_failures":1}
+    spring_health=runtime.influx_measurement_health(
+        interrupted_state,{"status":"stale"},spring_attempt+120)
+    assert spring_health["status"]=="probe_interrupted"
+    assert spring_health["should_alert"] is False
+    assert spring_health["next_eligible_at"]==int(datetime(
+        2026,3,29,12,0,tzinfo=runtime.TZ).timestamp())
     state={"last_attempt_at":autumn_attempt,
            "last_success":{**success,"measured_at":autumn_attempt},
            "last_attempt_outcome":{"attempted_at":autumn_attempt,
