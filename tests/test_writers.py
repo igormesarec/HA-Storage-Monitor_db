@@ -1,5 +1,6 @@
 """Offline verification of four locally scheduled writer windows per day."""
 from datetime import datetime, timedelta
+import pytest
 import sqlite3
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,18 @@ def windows(end_local, old_count=10, recent_count=11):
     return records
 
 
+def ranked_windows(end_local, entity_count):
+    counts={f"sensor.entity_{index:03d}":1000-index//2
+            for index in range(entity_count)}
+    records=[]
+    for i in range(32):
+        start,end=local_checkpoint_window(end_local-timedelta(hours=6*i))
+        records.append({"start_ts":start,"end_ts":end,"status":"ok",
+                        "reason":"","total_rows":sum(counts.values()),
+                        "counts":dict(counts)})
+    return records
+
+
 def test_four_daily_checkpoints_and_32_eight_day_windows():
     end=checkpoint()
     records=windows(end)
@@ -44,6 +57,44 @@ def test_four_daily_checkpoints_and_32_eight_day_windows():
     assert top['previous7_daily']==40
     assert top['ratio']==1.1
     assert result['all_recorder_rows_24h']==48
+
+
+@pytest.mark.parametrize("limit",(20,50,100,500))
+def test_configurable_writer_ranking_limits_are_stable(limit):
+    result=summarize_writer_windows(
+        ranked_windows(checkpoint(),600),int(checkpoint().timestamp()),limit)
+    assert len(result['entities'])==limit
+    assert result['selected_limit']==limit
+    assert result['ranked_entities_available']==600
+    assert result['selected_entities_count']==limit
+    # Equal counts are deterministically ordered by entity ID.
+    assert [row['entity_id'] for row in result['entities'][:4]]==[
+        'sensor.entity_000','sensor.entity_001',
+        'sensor.entity_002','sensor.entity_003']
+
+
+@pytest.mark.parametrize("limit",(0,19,21,499,501,True,None,"20"))
+def test_invalid_writer_ranking_limits_are_rejected(limit):
+    with pytest.raises(ValueError):
+        summarize_writer_windows(windows(checkpoint()),
+                                 int(checkpoint().timestamp()),limit)
+
+
+def test_ranking_returns_only_genuine_entities_when_fewer_than_limit_exist():
+    result=summarize_writer_windows(
+        ranked_windows(checkpoint(),13),int(checkpoint().timestamp()),500)
+    assert len(result['entities'])==13
+    assert result['selected_entities_count']==13
+    assert result['ranked_entities_available']==13
+
+
+def test_incomplete_latest_interval_never_invents_ranked_counts_for_large_limit():
+    records=ranked_windows(checkpoint(),120)[1:]
+    result=summarize_writer_windows(records,int(checkpoint().timestamp()),500)
+    assert result['status']=='learning'
+    assert result['ranking_period']=='unavailable'
+    assert result['entities']==[]
+    assert result['all_recorder_rows_24h'] is None
 
 
 def test_missing_window_never_misrepresents_complete_24h():

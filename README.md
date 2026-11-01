@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.2.1-beta.1` (28 October 2026)
+**Independent prototype:** `0.2.2-beta.1` (28 October 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -17,8 +17,9 @@
 - `engine.py`: 1-hour UTC-identity snapshots, 1y/2y/forever retention, persistent alerts/acknowledgments, strict growth threshold, and durable InfluxDB probe attempt/success metadata.
 - `sources.py`: Recorder main + WAL + SHM apparent/allocated file bytes, bounded generic SQLite file discovery (`*.db`, `*.sqlite`, `*.sqlite3`) in `/config` and `/config/.storage` at directory depth one, additional local SQLite files aggregated separately; excludes Recorder and the monitor snapshot database, HA `/config` filesystem capacity.
 - `supervisor.py`: 6-hour interval Supervisor `GET /host/disks/default/usage?max_depth=2` for specific `a0d7b954_influxdb` subtree. Returns `unavailable`, **not zero**, without exact authorized size. Accepts `apps_data` and `addons_data` Supervisor IDs. This may represent other components in the same InfluxDB add-on, not solely TSM shard files.
-- `writers.py`: optional bounded Recorder diagnostics, **disabled by default**. While disabled, Recorder is never opened for entity-writer queries and the dashboard reports `Recorder writer diagnostics disabled`, not zero rows. When explicitly enabled, one read-only query runs per local six-hour checkpoint with the existing timestamp index guard, 4-second progress budget, 500,000-row/5,000-entity/256-KiB payload caps, and compact counts stored in our own SQLite. The query streams indexed rows without SQL `GROUP BY` or a temporary grouping B-tree. No missed or pre-opt-in interval is queried retroactively.
-- `frontend/storage-monitor-card.js`: responsive seven-tab light/dark HA dashboard: Overview, Databases, Charts, Top Writers, Disk Usage, Alerts and Settings; real sampled history for 1/7/30/90 days; English/Slovenian switching; optional read-only display of the existing Recorder SQL sensor; no cloud dependencies.
+- `writers.py`: optional bounded Recorder diagnostics, **disabled by default**. While disabled, Recorder is never opened for entity-writer queries and the dashboard reports `Recorder writer diagnostics disabled`, not zero rows. When explicitly enabled, one read-only query runs per local six-hour checkpoint with the existing timestamp index guard, 4-second progress budget, 500,000-row/5,000-entity/256-KiB payload caps, and compact counts stored in our own SQLite. The query streams indexed rows without SQL `GROUP BY` or a temporary grouping B-tree. No missed or pre-opt-in interval is queried retroactively. Dashboard ranking can select Top 20/50/100/500 from those completed monitor-owned summaries without another Recorder query.
+- `frontend/storage-monitor-card.js`: responsive seven-tab light/dark HA dashboard: Overview, Databases, Charts, Top Writers, Disk Usage, Alerts and Settings; real sampled history for 1/7/30/90 days; English/Slovenian switching; optional read-only display of the existing Recorder SQL sensor; no cloud dependencies. Top 100/500 writer rankings use fixed 50-entity pages; integration groupings are explicitly partial totals for the selected Top N.
+- Writer ranking pagination bounds entity rows transferred and rendered, not the server-side aggregation of retained summaries. Each selection reads at most 40 completed rows from the monitor's own `writer_windows` table; it never reads Recorder. An offline 32-window/600-entity synthetic run averaged 2.497 ms for Top 500 and produced an 8,741-byte 50-entity page before integration grouping. This is not an HA OS performance guarantee.
 - `tests/`: offline, deterministic Python tests. These are **not** a replacement for HA OS integration tests.
 
 ### What the strict 5% alarm means

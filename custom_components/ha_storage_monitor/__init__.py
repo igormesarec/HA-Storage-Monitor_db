@@ -17,7 +17,9 @@ from .const import DOMAIN, DEFAULT_INFLUX_SLUG, ALARM_HOURS, GROWTH_SOURCES, res
 from .engine import Sample, SnapshotDB, evaluate, utc_hour, allow_notification, allowed_acknowledgement_sources, disk_low_evidence, DAY, HOUR
 from .sources import collect_local
 from .supervisor import get_influx_usage
-from .writers import collect_writer_checkpoint, disabled_writer_summary, local_checkpoint_window, summarize_writer_windows
+from .writers import (WRITER_PAGE_SIZE, WRITER_RANKING_LIMITS,
+                      collect_writer_checkpoint, disabled_writer_summary,
+                      local_checkpoint_window, summarize_writer_windows)
 
 _LOGGER = logging.getLogger(__name__)
 TZ = ZoneInfo("Europe/Ljubljana")
@@ -101,6 +103,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register commands before a config entry loads, no production changes."""
     websocket_api.async_register_command(hass, ws_summary)
     websocket_api.async_register_command(hass, ws_history)
+    websocket_api.async_register_command(hass, ws_writers)
     websocket_api.async_register_command(hass, ws_acknowledge)
     static_file = Path(__file__).parent/"frontend"/"storage-monitor-card.js"
     await hass.http.async_register_static_paths([
@@ -423,12 +426,61 @@ class StorageMonitor:
         except Exception:
             _LOGGER.exception("Storage Monitor resolved notification dismissal failed")
 
+    @staticmethod
+    def _writer_checkpoint_end(now: int) -> int:
+        local_now=datetime.fromtimestamp(int(now),TZ)
+        checkpoint=local_now.replace(hour=(local_now.hour//6)*6,
+                                     minute=0,second=0,microsecond=0)
+        return int(checkpoint.timestamp())
+
+    async def writer_ranking(self,limit: int,page: int) -> dict:
+        """Return one bounded page derived only from monitor-owned history."""
+        if type(limit) is not int or limit not in WRITER_RANKING_LIMITS:
+            raise ValueError("Invalid writer ranking limit")
+        if type(page) is not int or page < 1:
+            raise ValueError("Invalid writer ranking page")
+        if not self.writer_diagnostics_enabled:
+            result=disabled_writer_summary()
+            result.update({"selected_limit":limit,"page":1,
+                           "page_size":WRITER_PAGE_SIZE,"total_pages":0,
+                           "selected_entities_count":0,
+                           "ranked_entities_available":0,
+                           "grouped_by_integration":[]})
+            return result
+        checkpoint_end=self._writer_checkpoint_end(int(time.time()))
+        rows=await self.hass.async_add_executor_job(
+            self.db.writer_window_history,checkpoint_end-9*DAY,checkpoint_end)
+        result=summarize_writer_windows(rows,checkpoint_end,limit)
+        registry=er.async_get(self.hass)
+        grouped={}
+        for item in result["entities"]:
+            reg=registry.async_get(item["entity_id"])
+            platform=reg.platform if reg else "unknown"
+            item["integration"]=platform
+            group=grouped.setdefault(platform,{"integration":platform,
+                "rows_6h":0,"rows_24h":0 if result["last24_complete"] else None,
+                "entities_in_selected":0})
+            group["rows_6h"] += int(item.get("rows_6h") or 0)
+            if result["last24_complete"]:
+                group["rows_24h"] += int(item.get("rows_24h") or 0)
+            group["entities_in_selected"] += 1
+        result["grouped_by_integration"]=sorted(
+            grouped.values(),key=lambda row:(
+                -(row["rows_24h"] if row["rows_24h"] is not None
+                  else row["rows_6h"]),row["integration"]))
+        total=len(result["entities"])
+        total_pages=(total+WRITER_PAGE_SIZE-1)//WRITER_PAGE_SIZE
+        if page > max(1,total_pages):
+            raise ValueError("Writer ranking page exceeds available results")
+        start=(page-1)*WRITER_PAGE_SIZE
+        result["entities"]=result["entities"][start:start+WRITER_PAGE_SIZE]
+        result.update({"page":page,"page_size":WRITER_PAGE_SIZE,
+                       "total_pages":total_pages})
+        return result
+
     async def summary(self):
         now=utc_hour(int(time.time()))
-        local_now = datetime.fromtimestamp(now,TZ)
-        checkpoint_local = local_now.replace(hour=(local_now.hour//6)*6,
-                                             minute=0,second=0,microsecond=0)
-        checkpoint_end = int(checkpoint_local.timestamp())
+        checkpoint_end=self._writer_checkpoint_end(now)
         items=await self.hass.async_add_executor_job(self.db.latest)
         keys=[s["source"] for s in items]
         alerts={}
@@ -474,23 +526,11 @@ class StorageMonitor:
                 self.db.writer_window_history,checkpoint_end-9*DAY,checkpoint_end)
             writers = summarize_writer_windows(window_rows,checkpoint_end)
             writers["enabled_at"] = self.writer_diagnostics_enabled_at
+            # Entity rows have a separate bounded/paginated WebSocket route.
+            # Keep periodic summary refreshes small and Recorder-independent.
+            writers["entities"] = []
         else:
             writers = disabled_writer_summary()
-        registry = er.async_get(self.hass)
-        grouped = {}
-        for item in writers.get("entities",[]):
-            reg=registry.async_get(item["entity_id"])
-            platform=reg.platform if reg else "unknown"
-            item["integration"]=platform
-            group=grouped.setdefault(platform,{"integration":platform,
-                "rows_6h":0,"rows_24h":0 if writers["last24_complete"] else None,
-                "entities_in_top20":0})
-            group["rows_6h"] += int(item.get("rows_6h") or 0)
-            if writers["last24_complete"]:
-                group["rows_24h"] += int(item.get("rows_24h") or 0)
-            group["entities_in_top20"] += 1
-        writers["top20_grouped_by_integration"]=sorted(
-            grouped.values(),key=lambda r:-(r["rows_24h"] if r["rows_24h"] is not None else r["rows_6h"]))
         return {"samples":items,"alerts":alerts,"growth":growth,"writers":writers,
                 "influx_health":influx_health,
                 "now":int(time.time()),"timezone":"Europe/Ljubljana","changes":changes,
@@ -554,6 +594,25 @@ async def ws_history(hass,connection,msg):
     rows=await hass.async_add_executor_job(m.db.history,source,
                                            utc_hour(time.time())-int(msg["days"])*DAY,2200)
     connection.send_result(msg["id"],{"source":source,"samples":rows})
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"):"ha_storage_monitor/writers",
+                                   vol.Optional("limit",default=20):vol.In(
+                                       WRITER_RANKING_LIMITS),
+                                   vol.Optional("page",default=1):int})
+@websocket_api.async_response
+async def ws_writers(hass,connection,msg):
+    m=_monitor(hass)
+    if m is None:
+        connection.send_error(msg["id"],"not_loaded","Monitor not installed")
+        return
+    try:
+        result=await m.writer_ranking(int(msg["limit"]),int(msg["page"]))
+    except (TypeError,ValueError):
+        connection.send_error(msg["id"],"invalid_ranking_request",
+                              "Invalid writer limit or page")
+        return
+    connection.send_result(msg["id"],result)
 
 @websocket_api.require_admin
 @websocket_api.websocket_command({vol.Required("type"):"ha_storage_monitor/acknowledge",

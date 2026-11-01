@@ -189,13 +189,13 @@ test('growth alarms expose durable 24-hour and seven-day acknowledgments',async(
 test('enabled writer data and language switching remain functional',()=>{
   const enabled=summary({
     writer_diagnostics_enabled:true,
-    writers:{status:'ok',intervals_verified:32,intervals_required:32,entities:[{entity_id:'sensor.test',integration:'demo',rows_6h:12,rows_24h:48,share_percent:50,rate_per_min:.033,previous7_daily:24,ratio:2,high_writer:true}],top20_grouped_by_integration:[{integration:'demo',rows_6h:12,rows_24h:48,entities_in_top20:1}]},
+    writers:{status:'ok',intervals_verified:32,intervals_required:32,selected_limit:20,page:1,page_size:50,total_pages:1,entities:[{entity_id:'sensor.test',integration:'demo',rows_6h:12,rows_24h:48,share_percent:50,rate_per_min:.033,previous7_daily:24,ratio:2,high_writer:true}],grouped_by_integration:[{integration:'demo',rows_6h:12,rows_24h:48,entities_in_selected:1}]},
     effective_options:{...summary().effective_options,enable_recorder_writer_diagnostics:true},
   });
   const {dom,card}=cardWith(enabled);
   card._tab='writers'; card.render();
   assert.match(card.shadowRoot.textContent,/sensor\.test/);
-  assert.match(card.shadowRoot.textContent,/Partial integration totals derived from Top 20 entities/);
+  assert.match(card.shadowRoot.textContent,/Partial integration totals derived from selected Top 20/);
   assert.match(card.shadowRoot.textContent,/Records\/min/);
   assert.match(card.shadowRoot.textContent,/Prior 7d daily avg/);
   assert.match(card.shadowRoot.textContent,/2×/);
@@ -207,6 +207,60 @@ test('enabled writer data and language switching remain functional',()=>{
   card._tab='settings'; card.render(); const select=card.shadowRoot.querySelector('#language');
   select.value='sl'; select.dispatchEvent(new dom.window.Event('change'));
   assert.equal(card._language,'sl'); assert.match(card.shadowRoot.textContent,/Veljavne možnosti/);
+  dom.window.close();
+});
+
+test('Top Writers dropdown preserves limits and pages at most 50 monitor-history rows',async()=>{
+  const enabled=summary({
+    writer_diagnostics_enabled:true,
+    writers:{status:'ok',intervals_verified:32,intervals_required:32,entities:[]},
+    effective_options:{...summary().effective_options,enable_recorder_writer_diagnostics:true},
+  });
+  const ranking=(limit,page)=>{
+    const total=limit,totalPages=Math.ceil(total/50),start=(page-1)*50;
+    return {status:'ok',selected_limit:limit,selected_entities_count:total,
+      ranked_entities_available:600,page,page_size:50,total_pages:totalPages,
+      entities:Array.from({length:Math.min(50,total-start)},(_,offset)=>{
+        const index=start+offset;
+        return {entity_id:`sensor.writer_${String(index).padStart(3,'0')}`,
+          integration:index%2?'beta':'alpha',rows_6h:1000-index,
+          rows_24h:4000-index*4,share_percent:1,rate_per_min:1,
+          previous7_daily:3500-index*3.5,ratio:1.1,high_writer:false};
+      }),
+      grouped_by_integration:[
+        {integration:'alpha',rows_6h:123,rows_24h:456,entities_in_selected:Math.ceil(limit/2)},
+        {integration:'beta',rows_6h:122,rows_24h:455,entities_in_selected:Math.floor(limit/2)},
+      ]};
+  };
+  const {dom,card}=cardWith(enabled),calls=[];
+  card._hass={callWS:async message=>{calls.push(message);assert.equal(message.type,'ha_storage_monitor/writers');return ranking(message.limit,message.page);}};
+  card._writerData=ranking(20,1);card._tab='writers';card.render();
+  const limitSelect=card.shadowRoot.querySelector('#writer-limit');
+  assert.deepEqual([...limitSelect.options].map(option=>option.value),['20','50','100','500']);
+  assert.equal(limitSelect.value,'20');
+
+  limitSelect.value='500';limitSelect.dispatchEvent(new dom.window.Event('change'));
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(calls.at(-1).type,'ha_storage_monitor/writers');
+  assert.equal(calls.at(-1).limit,500);assert.equal(calls.at(-1).page,1);
+  assert.equal(card.shadowRoot.querySelectorAll('tbody')[1].querySelectorAll('tr').length,50);
+  assert.match(card.shadowRoot.textContent,/Partial integration totals derived from selected Top 500/);
+  assert.match(card.shadowRoot.textContent,/Page 1\/10/);
+
+  card._tab='overview';card.render();card._tab='writers';card.render();
+  assert.equal(card.shadowRoot.querySelector('#writer-limit').value,'500','selection survives tab navigation');
+  card.shadowRoot.querySelector('[data-writer-page="2"]').click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(calls.at(-1).type,'ha_storage_monitor/writers');
+  assert.equal(calls.at(-1).limit,500);assert.equal(calls.at(-1).page,2);
+  assert.match(card.shadowRoot.textContent,/sensor\.writer_050/);
+  assert.equal(card.shadowRoot.querySelectorAll('tbody')[1].querySelectorAll('tr').length,50);
+
+  card._language='sl';card.render();
+  assert.match(card.shadowRoot.textContent,/Razvrstitev entitet/);
+  assert.match(card.shadowRoot.textContent,/Delni seštevki integracij iz izbranih prvih 500/);
+  assert.ok(calls.every(call=>call.type==='ha_storage_monitor/writers'),
+    'changing ranking must only read monitor-owned writer history');
   dom.window.close();
 });
 
