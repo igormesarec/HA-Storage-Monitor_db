@@ -18,6 +18,7 @@ function summary(overrides={}) {
     ['recorder_shm',32*1024,'ok','file_stat_apparent'],
     ['influx_addon',null,'unavailable','supervisor_host_disk_usage'],
     ['database_total',9*MIB,'ok','sum_discovered_local_sqlite_files'],
+    ['database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3',null,'unavailable','sqlite_main_wal_shm_file_stat'],
     ['database:an-extremely-long-independent-database-name-for-layout.sqlite3',9*MIB,'ok','sqlite_main_wal_shm_file_stat'],
     ['disk_total',320*GIB,'ok','config_path_disk_usage'],
     ['disk_used',100*GIB,'ok','config_path_disk_usage'],
@@ -54,7 +55,8 @@ test('all seven views render nulls, long names, learning, alerts and units',()=>
   assert.deepEqual([...card.shadowRoot.querySelectorAll('[data-days]')].map(button=>button.dataset.days),['1','7','30','90']);
   card._tab='databases'; card.render();
   assert.match(card.shadowRoot.textContent,/Unavailable/);
-  assert.equal(card.shadowRoot.querySelector('[data-source^="database:"] .title').getAttribute('title'),'an-extremely-long-independent-database-name-for-layout.sqlite3');
+  assert.equal(card.shadowRoot.querySelector('[data-source="database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3"] .title').textContent,'Home Energy Intelligence');
+  assert.equal(card.shadowRoot.querySelector('[data-source="database:an-extremely-long-independent-database-name-for-layout.sqlite3"] .title').getAttribute('title'),'an-extremely-long-independent-database-name-for-layout.sqlite3');
   card._tab='writers'; card.render();
   assert.match(card.shadowRoot.textContent,/Recorder writer diagnostics disabled/);
   assert.doesNotMatch(card.shadowRoot.textContent,/0 rows/);
@@ -255,6 +257,14 @@ test('Top Writers dropdown preserves limits and pages at most 50 monitor-history
   assert.equal(calls.at(-1).limit,500);assert.equal(calls.at(-1).page,2);
   assert.match(card.shadowRoot.textContent,/sensor\.writer_050/);
   assert.equal(card.shadowRoot.querySelectorAll('tbody')[1].querySelectorAll('tr').length,50);
+
+  card._tab='databases';card.render();
+  const hei=card.shadowRoot.querySelector('[data-source="database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3"]');
+  assert.equal(hei.querySelector('.title').textContent,'Home Energy Intelligence');
+  assert.match(hei.textContent,/Unavailable/,'missing optional database must not render as zero');
+  card._tab='writers';card.render();
+  assert.equal(card.shadowRoot.querySelector('#writer-limit').value,'500',
+    'Top 500 selection survives visiting the Home Energy Intelligence database view');
 
   card._language='sl';card.render();
   assert.match(card.shadowRoot.textContent,/Razvrstitev entitet/);

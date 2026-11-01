@@ -29,7 +29,7 @@ class HAStorageMonitorCard extends HTMLElement {
   signed(value) { return value == null ? this.t('Unavailable', 'Ni na voljo') : `${value >= 0 ? '+' : '−'}${this.size(Math.abs(value))}`; }
   when(epoch) { return epoch ? new Date(epoch * 1000).toLocaleString(this._language === 'sl' ? 'sl-SI' : 'en-GB') : this.t('Unavailable', 'Ni na voljo'); }
   label(key) {
-    return ({recorder_main:'Recorder main SQLite',recorder_wal:'Recorder WAL',recorder_shm:'Recorder SHM',recorder_total:'Recorder total',influx_addon:'InfluxDB add-on total',database_total:'Other local SQLite total',disk_free:'Available /config space',disk_total:'Total /config filesystem',disk_used:'Used /config filesystem'})[key] || (key.startsWith('database:') ? key.slice(9) : key);
+    return ({recorder_main:'Recorder main SQLite',recorder_wal:'Recorder WAL',recorder_shm:'Recorder SHM',recorder_total:'Recorder total',influx_addon:'InfluxDB add-on total',database_total:'Other local SQLite total','database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3':'Home Energy Intelligence',disk_free:'Available /config space',disk_total:'Total /config filesystem',disk_used:'Used /config filesystem'})[key] || (key.startsWith('database:') ? key.slice(9) : key);
   }
   samples() { return Object.fromEntries((this._data?.samples || []).map(row => [row.source, row])); }
   async reload() {

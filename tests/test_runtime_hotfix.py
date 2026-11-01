@@ -381,6 +381,44 @@ def test_two_hour_stale_path_updates_persistent_alert(tmp_path, monkeypatch):
     assert len(notifications) == 1
 
 
+def test_home_energy_intelligence_unavailable_alert_uses_existing_cooldown(
+        tmp_path, monkeypatch):
+    runtime = _load_runtime(monkeypatch)
+    source = ("database:.storage/home_energy_intelligence/"
+              "home_energy_intelligence.sqlite3")
+    end = datetime(2026, 11, 10, 18, tzinfo=runtime.TZ)
+    now = int(end.timestamp()) // runtime.HOUR * runtime.HOUR
+    monkeypatch.setattr(runtime.time, "time", lambda: now)
+
+    def local_samples(config, hour, measured):
+        return _samples(runtime, hour) + [runtime.Sample(
+            hour, source, None, "unavailable",
+            "sqlite_main_wal_shm_file_stat", None,
+            detail="Local database file or sidecar unreadable")]
+
+    monkeypatch.setattr(runtime, "collect_local", local_samples)
+    monkeypatch.setattr(runtime, "get_influx_usage", _unavailable_influx(runtime))
+    hass = StrictHass(tmp_path)
+    monitor = runtime.StorageMonitor(hass, Entry())
+    monitor.db.initialize()
+    monitor.db.save([runtime.Sample(
+        now - runtime.HOUR, source, None, "unavailable",
+        "sqlite_main_wal_shm_file_stat", None)])
+
+    async def scenario():
+        await monitor.sample(False)
+        await monitor.sample(False)
+
+    _run(scenario())
+    alert = monitor.db.get_alert("stale:" + source)
+    notifications = [call for call in hass.notification_calls
+                     if call[2]["title"] ==
+                     "Storage Monitor measurement unavailable"]
+    assert alert["active"] == 1
+    assert alert["last_notify_at"] == now
+    assert len(notifications) == 1
+
+
 def test_influx_startup_checkpoint_restart_failure_and_dst_scheduling(
         tmp_path, monkeypatch):
     runtime = _load_runtime(monkeypatch)
