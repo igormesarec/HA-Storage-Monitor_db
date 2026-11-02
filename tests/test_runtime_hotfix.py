@@ -153,6 +153,15 @@ def test_no_executor_call_passes_keywords_directly():
     assert all(not node.keywords for node in executor_calls)
 
 
+def test_source_lifecycle_websockets_are_admin_only():
+    tree=ast.parse((INTEGRATION / "__init__.py").read_text(encoding="utf-8"))
+    functions={node.name:node for node in tree.body
+               if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))}
+    for name in ("ws_retire_source","ws_reactivate_source"):
+        decorators=[ast.unparse(item) for item in functions[name].decorator_list]
+        assert "websocket_api.require_admin" in decorators
+
+
 def test_startup_writer_off_normal_disk_unavailable_influx_and_summary(
         tmp_path, monkeypatch):
     runtime = _load_runtime(monkeypatch)
@@ -199,6 +208,117 @@ def test_startup_writer_off_normal_disk_unavailable_influx_and_summary(
     }
     assert connection.results[0][0] == 7
     assert connection.results[0][1]["writer_diagnostics_enabled"] is False
+
+
+def test_retired_source_is_quarantined_aggregate_survives_and_reactivation_learns(
+        tmp_path,monkeypatch):
+    runtime=_load_runtime(monkeypatch)
+    current=[int(datetime(2026,11,10,12,tzinfo=runtime.TZ).timestamp())]
+    monkeypatch.setattr(runtime.time,"time",lambda:current[0])
+    retired='database:si-grid-retired.sqlite3'
+    active='database:si-grid-active.sqlite3'
+    include_retired=[False]
+
+    def local_samples(config,hour,measured):
+        local=[runtime.Sample(hour,active,200,'ok','file_stat',measured)]
+        if include_retired[0]:
+            local.append(runtime.Sample(hour,retired,100,'ok','file_stat',measured))
+        return _samples(runtime,hour)+local+[
+            runtime.Sample(hour,'database_total',sum(row.size for row in local),'ok',
+                           'sum_discovered_local_sqlite_files',measured)]
+
+    monkeypatch.setattr(runtime,'collect_local',local_samples)
+    hass=StrictHass(tmp_path);entry=Entry();monitor=runtime.StorageMonitor(hass,entry)
+    monitor.db.initialize()
+    start=runtime.utc_hour(current[0])-8*runtime.DAY
+    historical=[runtime.Sample(start+i*runtime.HOUR,retired,100+i,'ok',
+                               'file_stat',start+i*runtime.HOUR)
+                for i in range(193)]
+    monitor.db.save(historical)
+    monitor.db.save([
+        runtime.Sample(runtime.utc_hour(current[0]),active,200,'ok','file_stat',
+                       runtime.utc_hour(current[0])),
+        runtime.Sample(runtime.utc_hour(current[0]),'database_total',300,'ok',
+                       'sum_discovered_local_sqlite_files',runtime.utc_hour(current[0])),
+    ])
+    monitor.db.set_alert(retired,active=True,window='2026-11-10:06',
+                         now=current[0],notified=True)
+    monitor.db.set_alert('stale:'+retired,active=True,window='2026-11-10:06',
+                         now=current[0],notified=True)
+    before=monitor.db.history(retired,start)
+
+    result=_run(monitor.retire_source(retired))
+    assert result['retired'] is True
+    dismissed={call[2]['notification_id'] for call in hass.notification_calls
+               if call[1]=='dismiss'}
+    assert dismissed=={
+        'ha_storage_monitor_growth_database_si-grid-retired.sqlite3',
+        'ha_storage_monitor_stale_database_si-grid-retired.sqlite3'}
+    immediate=_run(monitor.summary())
+    immediate_latest={row['source']:row for row in immediate['samples']}
+    assert immediate_latest['database_total']['size']==200
+
+    current[0]+=runtime.HOUR
+    _run(monitor.sample(False))
+    latest={row['source']:row for row in monitor.db.latest()}
+    assert latest['database_total']['status']=='ok'
+    assert latest['database_total']['size']==200
+    assert monitor.db.history(retired,start)==before
+    assert monitor.db.retired_sources()[0]['last_detected_at'] is None
+    current[0]+=runtime.HOUR
+    _run(monitor.sample(False))
+    assert monitor.db.get_alert('stale:'+retired)['active']==0
+    assert monitor.db.history(retired,start)==before
+
+    include_retired[0]=True
+    current[0]+=runtime.HOUR
+    _run(monitor.sample(False))
+    latest={row['source']:row for row in monitor.db.latest()}
+    assert latest['database_total']['size']==200
+    assert monitor.db.history(retired,start)==before
+    state=monitor.db.retired_sources()[0]
+    assert state['last_detected_at']==current[0]
+    assert monitor.db.get_alert(retired)['active']==0
+    assert monitor.db.get_alert('stale:'+retired)['active']==0
+    summary=_run(monitor.summary())
+    assert retired not in {row['source'] for row in summary['samples']}
+    assert summary['retired_sources'][0]['source']==retired
+
+    current[0]+=runtime.HOUR
+    _run(monitor.reactivate_source(retired))
+    current[0]+=runtime.HOUR
+    _run(monitor.sample(False))
+    after=monitor.db.history(retired,start)
+    assert len(after)==len(before)+1
+    summary=_run(monitor.summary())
+    assert retired in {row['source'] for row in summary['samples']}
+    assert summary['growth'][retired]['status']=='learning'
+
+
+def test_reactivation_requires_two_new_missing_observations(tmp_path,monkeypatch):
+    runtime=_load_runtime(monkeypatch)
+    now=int(datetime(2026,11,10,12,tzinfo=runtime.TZ).timestamp())
+    source='database:reactivated.sqlite3'
+    hass=StrictHass(tmp_path);monitor=runtime.StorageMonitor(hass,Entry())
+    monitor.db.initialize()
+    old_hour=runtime.utc_hour(now)
+    monitor.db.save([runtime.Sample(old_hour,source,None,'unavailable',
+                                    'file_stat',None)])
+    monitor.db.retire_source(source,now+60)
+    monitor.db.reactivate_source(source,now+120)
+    first=old_hour+runtime.HOUR
+    sample1=runtime.Sample(first,source,None,'unavailable','file_stat',None)
+    monitor.db.save([sample1])
+    _run(monitor.check_stale([sample1],first,
+                             datetime.fromtimestamp(first,runtime.TZ)))
+    assert monitor.db.get_alert('stale:'+source)['active']==0
+
+    second=first+runtime.HOUR
+    sample2=runtime.Sample(second,source,None,'unavailable','file_stat',None)
+    monitor.db.save([sample2])
+    _run(monitor.check_stale([sample2],second,
+                             datetime.fromtimestamp(second,runtime.TZ)))
+    assert monitor.db.get_alert('stale:'+source)['active']==1
 
 
 def test_writer_ranking_websocket_pages_monitor_history_without_recorder_query(

@@ -100,6 +100,63 @@ def test_snapshot_history_survives_restart_and_retention_only_own(tmp_path):
     assert len(db2.history('disk_free',T-DAY))==1
 
 
+def test_local_sqlite_retirement_preserves_history_alert_state_and_restart(tmp_path):
+    path=tmp_path/'own.sqlite3'
+    source='database:si-grid-retired.sqlite3'
+    db=SnapshotDB(path);db.initialize()
+    db.save([Sample(T-DAY,source,123,'ok','file_stat',T-DAY),
+             Sample(T,source,456,'ok','file_stat',T)])
+    db.set_alert(source,active=True,window='2026-11-01:18',now=T,notified=True)
+    db.acknowledge(source,T+7*DAY)
+    db.set_alert('stale:'+source,active=True,window='2026-11-01:18',
+                 now=T,notified=True)
+    before=db.history(source,T-2*DAY)
+
+    result=db.retire_source(source,T+HOUR)
+
+    assert result=={'source':source,'retired':True,'retired_at':T+HOUR}
+    assert db.history(source,T-2*DAY)==before
+    assert db.get_alert(source)['active']==0
+    assert db.get_alert(source)['acknowledged_until']==T+7*DAY
+    assert db.get_alert('stale:'+source)['active']==0
+    restarted=SnapshotDB(path)
+    assert restarted.retired_source_keys()=={source}
+    assert restarted.latest_source_membership_change()==T+HOUR
+    assert restarted.retired_sources()[0]['last_detected_at'] is None
+    restarted.save([Sample(T+2*HOUR,source,999,'ok','file_stat',T+2*HOUR)])
+    restarted.set_alert(source,active=True,window='2026-11-02:00',
+                        now=T+2*HOUR,notified=True)
+    restarted.set_alert('stale:'+source,active=True,window='2026-11-02:00',
+                        now=T+2*HOUR,notified=True)
+    assert restarted.history(source,T-2*DAY)==before
+    assert restarted.get_alert(source)['active']==0
+    assert restarted.get_alert('stale:'+source)['active']==0
+
+    restarted.note_retired_detected({source},T+2*HOUR)
+    assert db.retired_sources()[0]['last_detected_at']==T+2*HOUR
+    repeated=restarted.retire_source(source,T+2*HOUR+30)
+    assert repeated['retired_at']==T+HOUR
+    assert db.retired_sources()[0]['last_detected_at']==T+2*HOUR
+    reactivated=restarted.reactivate_source(source,T+3*HOUR)
+    assert reactivated['reactivated_at']==T+3*HOUR
+    assert db.retired_source_keys()==set()
+    assert db.reactivated_at(source)==T+3*HOUR
+    assert db.latest_source_membership_change()==T+3*HOUR
+    assert db.history(source,T-2*DAY)==before
+
+
+def test_retirement_rejects_non_database_and_unobserved_sources(tmp_path):
+    db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()
+    db.save([Sample(T,'recorder_total',123,'ok','file_stat',T)])
+    for source in ('recorder_total','database:not-observed.sqlite3','database:\x00bad'):
+        try:
+            db.retire_source(source,T)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'{source} should not be retirable')
+
+
 def test_successful_source_identity_survives_snapshot_retention(tmp_path):
     source='database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3'
     db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()

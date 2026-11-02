@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.2.3-beta.1` (1 November 2026)
+**Independent prototype:** `0.2.4-beta.1` (2 November 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -69,6 +69,34 @@ These are instructions only, **not actions already performed**.
 - This is **not** an exhaustive scan of HA OS, protected Supervisor add-on directories, MariaDB/PostgreSQL services, remote SQL databases, or other volumes. Unknown paths and unavailable protected stores remain unavailable, never zero. Future configured additional directories and supported read-only service-specific metrics require separate access review.
 - Existing Recorder SQL sensor is preserved, and our own monitoring history DB is excluded to prevent recursive monitoring growth.
 - A discovered database file is monitored using filesystem metadata, not opened for SQL queries, and no production database is ever edited.
+
+### Retiring a local SQLite source
+
+An administrator can retire a previously observed `database:*` source from the
+card's **Settings** tab. Retirement writes only a lifecycle row in Storage
+Monitor's own `.storage/ha_storage_monitor_history.sqlite3`; it never opens,
+renames, deletes, or writes the monitored SQLite file or its WAL/SHM sidecars.
+Existing snapshot timestamps and values remain selectable in **Charts** with a
+**Retired / Upokojeno** label. The source is removed from current database
+lists, the active-growth set and missing-source checks. Existing growth and
+missing-source alert state is closed, while acknowledgment/cooldown evidence is
+preserved, and only Storage Monitor's corresponding persistent notifications
+are dismissed.
+
+The **Other local SQLite total** includes successfully measured, currently
+discovered, non-retired generic files. A retired missing source therefore does
+not make that aggregate unavailable. An inaccessible active source or an
+incomplete bounded directory scan still makes the aggregate unavailable rather
+than presenting a partial total.
+
+A retired source that reappears is detected through the same bounded
+read-only filesystem metadata scan but stays quarantined: no new snapshot is
+accepted and no alert is raised. The Settings tab reports that it was detected
+again. It resumes only after the administrator explicitly selects
+**Reactivate / Ponovno aktiviraj**. Reactivation preserves old history but
+starts a new eight-elapsed-day learning period before growth alarms can use the
+new evidence, preventing silent mixing of pre-retirement and post-reactivation
+measurements.
 
 ## Read-only capability probe, Terminal access verified, Core access pending
 

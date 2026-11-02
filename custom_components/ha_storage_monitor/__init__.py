@@ -105,6 +105,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     websocket_api.async_register_command(hass, ws_history)
     websocket_api.async_register_command(hass, ws_writers)
     websocket_api.async_register_command(hass, ws_acknowledge)
+    websocket_api.async_register_command(hass, ws_retire_source)
+    websocket_api.async_register_command(hass, ws_reactivate_source)
     static_file = Path(__file__).parent/"frontend"/"storage-monitor-card.js"
     await hass.http.async_register_static_paths([
         StaticPathConfig("/ha_storage_monitor/storage-monitor-card.js",str(static_file),False)
@@ -231,13 +233,28 @@ class StorageMonitor:
                             "No successful Supervisor probe is cached")
                     samples.append(Sample(hour,"influx_addon",None,"unavailable",
                                           "supervisor_addons_data_total",None,detail=detail))
-            # Record disappeared local SQLite files as unavailable, not as a false zero.
+            # Retirement is monitor-owned metadata. Reappearing retired files
+            # remain excluded until an administrator explicitly reactivates
+            # them, so old and new evidence is never mixed silently.
+            retired=await self.hass.async_add_executor_job(
+                self.db.retired_source_keys)
+            detected={s.source for s in samples
+                      if s.source in retired and s.status != "not_configured"}
+            if detected:
+                await self.hass.async_add_executor_job(
+                    self.db.note_retired_detected,detected,now)
+            samples=self._exclude_retired_sources(samples,retired,hour,now)
+
+            # Record disappeared active local SQLite files as unavailable, not
+            # as a false zero. Explicitly retired sources are intentionally
+            # absent and must not invalidate the active aggregate.
             former=await self.hass.async_add_executor_job(self.db.latest)
             discovered={s.source for s in samples}
             missing_databases = False
             for old in former:
                 key=old["source"]
-                if key.startswith("database:") and key not in discovered:
+                if (key.startswith("database:") and key not in retired and
+                        key not in discovered):
                     missing_databases = True
                     samples.append(Sample(hour,key,None,"unavailable","file_stat",None,
                                           detail="previously monitored database not found"))
@@ -279,15 +296,87 @@ class StorageMonitor:
                     self.hass,self.sample(True),
                     "Storage Monitor deferred checkpoint")
 
+    @staticmethod
+    def _exclude_retired_sources(samples: list[Sample], retired: set[str],
+                                 hour: int, now: int) -> list[Sample]:
+        """Exclude retired current evidence and correct the generic total."""
+        if not retired:
+            return samples
+        generic=[s for s in samples if s.source.startswith("database:") and
+                 s.source != HOME_ENERGY_INTELLIGENCE_SOURCE]
+        active=[s for s in generic if s.source not in retired]
+        retired_discovered=[s for s in generic if s.source in retired]
+        result=[]
+        for sample in samples:
+            if sample.source in retired:
+                continue
+            if sample.source != "database_total":
+                result.append(sample)
+                continue
+            can_recalculate=(
+                sample.status == "ok" or
+                (sample.detail == "A currently discovered database is unreadable" and
+                 all(item.status == "ok" for item in active) and
+                 any(item.status != "ok" for item in retired_discovered)))
+            if can_recalculate:
+                allocated=(sum(int(item.allocated) for item in active)
+                           if all(item.allocated is not None for item in active)
+                           else None)
+                result.append(Sample(
+                    hour,"database_total",sum(int(item.size) for item in active),
+                    "ok","sum_discovered_local_sqlite_files",now,allocated,
+                    detail="Currently discovered non-retired local SQLite files"))
+            else:
+                result.append(sample)
+        return result
+
+    @staticmethod
+    def _latest_without_retired(items: list[dict], retired: set[str]) -> list[dict]:
+        """Return an exact current view without rewriting stored evidence."""
+        if not retired:
+            return items
+        total=next((row for row in items if row["source"]=="database_total"),None)
+        generic=[row for row in items if row["source"].startswith("database:")
+                 and row["source"] != HOME_ENERGY_INTELLIGENCE_SOURCE]
+        active=[row for row in generic if row["source"] not in retired]
+        allowed_detail={"Previously monitored database missing",
+                        "A currently discovered database is unreadable"}
+        exact=(total is not None and
+               (total["status"]=="ok" or total.get("detail") in allowed_detail) and
+               all(row["status"]=="ok" and row["hour"]==total["hour"]
+                   for row in active))
+        adjusted=None
+        if exact:
+            adjusted=dict(total)
+            adjusted.update({
+                "size":sum(int(row["size"]) for row in active),
+                "status":"ok",
+                "measured_at":int(total["hour"]),
+                "allocated":(sum(int(row["allocated"]) for row in active)
+                             if all(row["allocated"] is not None for row in active)
+                             else None),
+                "detail":"Currently discovered non-retired local SQLite files",
+            })
+        return [adjusted if row["source"]=="database_total" and adjusted else row
+                for row in items if row["source"] not in retired]
+
     async def check_growth(self,hour: int,local_now: datetime):
         keys=["recorder_total","influx_addon"]
         latest=await self.hass.async_add_executor_job(self.db.latest)
-        keys.extend(x["source"] for x in latest if x["source"].startswith("database:"))
+        retired=await self.hass.async_add_executor_job(self.db.retired_source_keys)
+        keys.extend(x["source"] for x in latest
+                    if x["source"].startswith("database:") and
+                    x["source"] not in retired)
         window=f"{local_now.date().isoformat()}:{(local_now.hour//6)*6:02d}"
         for key in keys:
             evidence=await self.hass.async_add_executor_job(
                 partial(self.db.growth_evidence,key,hour,
                         hourly_source=key!="influx_addon"))
+            reactivated=await self.hass.async_add_executor_job(
+                self.db.reactivated_at,key)
+            if reactivated is not None and hour < reactivated + 8*DAY:
+                evidence={"points":[],"observed_shrink":False,
+                          "hourly_coverage_ok":False}
             ev=evaluate(key,evidence["points"],hour,
                 min_excess_bytes=int(self.options.get("min_excess_mib",0))*1024*1024,
                 cadence_hours=6,
@@ -360,6 +449,11 @@ class StorageMonitor:
                 continue
             fresh=item.status=="ok"
             last=await self.hass.async_add_executor_job(self.db.last_two,key)
+            reactivated=await self.hass.async_add_executor_job(
+                self.db.reactivated_at,key)
+            if reactivated is not None:
+                first_new_hour=utc_hour(reactivated)+HOUR
+                last=[row for row in last if row["hour"]>=first_new_hour]
             stale=(not fresh and len(last)==2 and
                    last[0]["hour"]-last[1]["hour"]==HOUR and
                    all(x["status"] in ("unavailable","stale") for x in last))
@@ -446,6 +540,19 @@ class StorageMonitor:
         except Exception:
             _LOGGER.exception("Storage Monitor resolved notification dismissal failed")
 
+    async def retire_source(self,source: str) -> dict:
+        result=await self.hass.async_add_executor_job(
+            self.db.retire_source,source,int(time.time()))
+        # Durable alert state is cleared in the same monitor-DB transaction;
+        # notification delivery state cannot undo that safety guarantee.
+        await self._dismiss_safely("growth:"+source)
+        await self._dismiss_safely("stale_"+source)
+        return result
+
+    async def reactivate_source(self,source: str) -> dict:
+        return await self.hass.async_add_executor_job(
+            self.db.reactivate_source,source,int(time.time()))
+
     @staticmethod
     def _writer_checkpoint_end(now: int) -> int:
         local_now=datetime.fromtimestamp(int(now),TZ)
@@ -501,7 +608,11 @@ class StorageMonitor:
     async def summary(self):
         now=utc_hour(int(time.time()))
         checkpoint_end=self._writer_checkpoint_end(now)
-        items=await self.hass.async_add_executor_job(self.db.latest)
+        retired_sources=await self.hass.async_add_executor_job(
+            self.db.retired_sources)
+        retired={row["source"] for row in retired_sources}
+        all_items=await self.hass.async_add_executor_job(self.db.latest)
+        items=self._latest_without_retired(all_items,retired)
         keys=[s["source"] for s in items]
         alerts={}
         growth={}
@@ -511,6 +622,12 @@ class StorageMonitor:
                 evidence=await self.hass.async_add_executor_job(
                     partial(self.db.growth_evidence,key,checkpoint_end,
                             hourly_source=key!="influx_addon"))
+                reactivated=await self.hass.async_add_executor_job(
+                    self.db.reactivated_at,key)
+                if (reactivated is not None and
+                        checkpoint_end < reactivated + 8*DAY):
+                    evidence={"points":[],"observed_shrink":False,
+                              "hourly_coverage_ok":False}
                 growth[key]=evaluate(key,evidence["points"],checkpoint_end,cadence_hours=6,
                     observed_shrink=evidence["observed_shrink"],
                     hourly_coverage_ok=evidence["hourly_coverage_ok"]).as_json()
@@ -530,15 +647,33 @@ class StorageMonitor:
                 influx_health["status"]="prolonged_unavailable"
         # One-hour history is in OUR sqlite, independent of HA Recorder retention.
         changes={}
+        current_items={row["source"]:row for row in items}
+        membership_change=await self.hass.async_add_executor_job(
+            self.db.latest_source_membership_change)
+        membership_hour=(utc_hour(membership_change)+HOUR
+                         if membership_change is not None else None)
         for key in keys:
             hist=await self.hass.async_add_executor_job(self.db.history,key,now-24*HOUR,26)
             samples_by_hour={x["hour"]:x for x in hist if x["size"] is not None and x["status"]=="ok"}
-            current=samples_by_hour.get(now)
+            displayed=current_items.get(key)
+            current=(displayed if displayed and displayed["hour"]==now and
+                     displayed["size"] is not None and displayed["status"]=="ok"
+                     else None)
+            reactivated=await self.hass.async_add_executor_job(
+                self.db.reactivated_at,key)
+            first_new_hour=(utc_hour(reactivated)+HOUR
+                            if reactivated is not None else None)
             changes[key]={}
             for delta in (6,24):
                 older=samples_by_hour.get(now-delta*HOUR)
                 changes[key]["delta"+str(delta)+"h"] = (
-                    current["size"]-older["size"] if current and older else None)
+                    current["size"]-older["size"]
+                    if (current and older and
+                        (first_new_hour is None or older["hour"]>=first_new_hour) and
+                        (key!="database_total" or membership_hour is None or
+                         (current["hour"]>=membership_hour and
+                          older["hour"]>=membership_hour)))
+                    else None)
         # Disabled means no Recorder access and no historical results presented
         # as current. Enabled dashboards read only the monitor's own summaries.
         if self.writer_diagnostics_enabled:
@@ -552,6 +687,7 @@ class StorageMonitor:
         else:
             writers = disabled_writer_summary()
         return {"samples":items,"alerts":alerts,"growth":growth,"writers":writers,
+                "retired_sources":retired_sources,
                 "influx_health":influx_health,
                 "now":int(time.time()),"timezone":"Europe/Ljubljana","changes":changes,
                 "writer_diagnostics_enabled":self.writer_diagnostics_enabled,
@@ -651,3 +787,35 @@ async def ws_acknowledge(hass,connection,msg):
         return
     await hass.async_add_executor_job(m.db.acknowledge,msg["source"],int(time.time())+int(msg["hours"])*HOUR)
     connection.send_result(msg["id"],{"acknowledged":True,"hours":msg["hours"]})
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"):"ha_storage_monitor/retire_source",
+                                   vol.Required("source"):str})
+@websocket_api.async_response
+async def ws_retire_source(hass,connection,msg):
+    m=_monitor(hass)
+    if m is None:
+        connection.send_error(msg["id"],"not_loaded","Monitor not installed")
+        return
+    try:
+        result=await m.retire_source(msg["source"])
+    except ValueError as err:
+        connection.send_error(msg["id"],"invalid_source",str(err))
+        return
+    connection.send_result(msg["id"],result)
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"):"ha_storage_monitor/reactivate_source",
+                                   vol.Required("source"):str})
+@websocket_api.async_response
+async def ws_reactivate_source(hass,connection,msg):
+    m=_monitor(hass)
+    if m is None:
+        connection.send_error(msg["id"],"not_loaded","Monitor not installed")
+        return
+    try:
+        result=await m.reactivate_source(msg["source"])
+    except ValueError as err:
+        connection.send_error(msg["id"],"invalid_source",str(err))
+        return
+    connection.send_result(msg["id"],result)

@@ -254,7 +254,7 @@ def test_non_destructive_v1_monitor_store_upgrade(tmp_path):
     store.initialize()
     assert store.writer_window_history(0,999)==[]
     with sqlite3.connect(p) as db:
-        assert db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0]=='2'
+        assert db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0]=='3'
         assert db.execute('SELECT hour FROM writers').fetchone()[0]==42
 
 
