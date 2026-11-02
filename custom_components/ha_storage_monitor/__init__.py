@@ -15,7 +15,7 @@ from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers import entity_registry as er
 from .const import DOMAIN, DEFAULT_INFLUX_SLUG, ALARM_HOURS, GROWTH_SOURCES, resolved_options
 from .engine import Sample, SnapshotDB, evaluate, utc_hour, allow_notification, allowed_acknowledgement_sources, disk_low_evidence, DAY, HOUR
-from .sources import collect_local
+from .sources import collect_local, HOME_ENERGY_INTELLIGENCE_SOURCE
 from .supervisor import get_influx_usage
 from .writers import (WRITER_PAGE_SIZE, WRITER_RANKING_LIMITS,
                       collect_writer_checkpoint, disabled_writer_summary,
@@ -159,6 +159,20 @@ class StorageMonitor:
             hour=utc_hour(now)
             local_now=datetime.fromtimestamp(now,TZ)
             samples=await self.hass.async_add_executor_job(collect_local,self.hass.config.config_dir,hour,now)
+            # A physically absent optional database is quiet until it has
+            # genuinely been measured. The durable marker lives only in our
+            # monitor SQLite and is seeded from existing snapshots on upgrade.
+            for index, sample in enumerate(samples):
+                if (sample.source == HOME_ENERGY_INTELLIGENCE_SOURCE and
+                        sample.status == "not_configured"):
+                    was_measured = await self.hass.async_add_executor_job(
+                        self.db.source_was_successful, sample.source)
+                    if was_measured:
+                        samples[index] = Sample(
+                            hour, sample.source, None, "unavailable",
+                            sample.method, None, detail=(
+                                "Previously measured Home Energy Intelligence "
+                                "database is now missing"))
             # A startup or local 00/06/12/18 checkpoint may request the
             # expensive Supervisor scan. Reserve the attempt durably first:
             # failures and quick restarts still observe the strict six elapsed
@@ -337,12 +351,18 @@ class StorageMonitor:
         for key in keys:
             item=bykey.get(key)
             if not item: continue
-            fresh=item.status=="ok"
             previous=await self.hass.async_add_executor_job(self.db.get_alert,"stale:"+key)
+            if item.status == "not_configured":
+                if previous["active"]:
+                    await self._set_alert("stale:"+key,active=False,
+                                          window=previous["last_window"],now=hour)
+                    await self._dismiss_safely("stale_"+key)
+                continue
+            fresh=item.status=="ok"
             last=await self.hass.async_add_executor_job(self.db.last_two,key)
-            stale=(not fresh and len(last)==2 and last[0]["hour"]-last[1]["hour"]==HOUR
-                   and all(x["status"] in ("unavailable","stale") or (x["measured_at"] is None)
-                           for x in last))
+            stale=(not fresh and len(last)==2 and
+                   last[0]["hour"]-last[1]["hour"]==HOUR and
+                   all(x["status"] in ("unavailable","stale") for x in last))
             notify=stale and allow_notification(previous,window,hour) and (
                  not previous["active"] or bool(self.options.get("repeat_notifications",False)))
             if notify:

@@ -5,7 +5,7 @@ MiB=1024**2
 T=10_000*HOUR
 
 
-def populate(db, *, missing=None, shrink=False):
+def populate(db, *, missing=None, shrink=False, source='recorder_total'):
     rows=[]
     for i in range(8*24+1):
         hour=T-8*DAY+i*HOUR
@@ -17,7 +17,7 @@ def populate(db, *, missing=None, shrink=False):
         if shrink and i==45:  # Non-checkpoint: 45 % 6 != 0
             size-=500*MiB
         if missing is None or i not in missing:
-            rows.append(Sample(hour,'recorder_total',size,'ok','stat',hour))
+            rows.append(Sample(hour,source,size,'ok','stat',hour))
     db.save(rows)
 
 
@@ -33,6 +33,19 @@ def test_evaluation_reads_33_checkpoints_not_193_hourly_rows(tmp_path):
     assert result.status=='alarm'
     assert result.delta24==211*MiB
     assert result.baseline_daily==200*MiB
+
+
+def test_home_energy_intelligence_uses_hourly_eight_day_growth_evidence(tmp_path):
+    source='database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3'
+    db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()
+    populate(db,source=source)
+    evidence=db.growth_evidence(source,T,hourly_source=True)
+    result=evaluate(source,evidence['points'],T,cadence_hours=6,
+                    observed_shrink=evidence['observed_shrink'],
+                    hourly_coverage_ok=evidence['hourly_coverage_ok'])
+    assert len(evidence['points'])==33
+    assert evidence['hourly_coverage_ok'] is True
+    assert result.status=='alarm'
 
 
 def test_hourly_purge_between_checkpoints_is_not_hidden(tmp_path):

@@ -21,7 +21,7 @@ class Sample:
     hour: int  # UTC epoch-hour identity, including separate DST fallback 02:00s
     source: str
     size: int | None
-    status: str  # ok / cached / stale / unavailable
+    status: str  # ok / cached / stale / unavailable / not_configured
     method: str
     measured_at: int | None
     allocated: int | None = None
@@ -166,6 +166,15 @@ class SnapshotDB:
                  allocated=excluded.allocated, detail=excluded.detail
                WHERE NOT (snapshots.status='ok' AND excluded.status!='ok')
              """, [(s.hour,s.source,s.size,s.status,s.method,s.measured_at,s.allocated,s.detail[:150]) for s in rows])
+            # Durable source identity survives snapshot retention. This lets an
+            # optional source distinguish "never configured" from "measured
+            # before, now missing" without consulting any production database.
+            successful_sources = {sample.source for sample in rows
+                                  if sample.status == "ok" and
+                                  sample.size is not None}
+            db.executemany("""INSERT INTO metadata(key,value) VALUES(?, '1')
+                ON CONFLICT(key) DO UPDATE SET value='1'""",
+                [("source_ever_ok:" + source,) for source in successful_sources])
 
     def reserve_influx_probe(self, now: int, minimum_elapsed: int = 6 * HOUR) -> bool:
         """Atomically reserve one expensive Supervisor scan.
@@ -378,6 +387,24 @@ class SnapshotDB:
                JOIN (SELECT source, MAX(hour) hour FROM snapshots GROUP BY source) m
                ON m.source=s.source AND m.hour=s.hour ORDER BY s.source""").fetchall()
             return [dict(r) for r in rows]
+
+    def source_was_successful(self, source: str) -> bool:
+        """Return durable success knowledge, seeding it from legacy history."""
+        key = "source_ever_ok:" + source
+        with _raw_connection(self.path) as db:
+            known = db.execute(
+                "SELECT value FROM metadata WHERE key=?", (key,)
+            ).fetchone()
+            if known is not None:
+                return known[0] == "1"
+            historical = db.execute("""SELECT 1 FROM snapshots
+                WHERE source=? AND status='ok' AND size IS NOT NULL LIMIT 1""",
+                (source,)).fetchone()
+            value = "1" if historical is not None else "0"
+            db.execute("""INSERT INTO metadata(key,value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (key, value))
+            return historical is not None
 
     def history(self, source: str, since: int, limit: int = 2200):
         with _raw_connection(self.path) as db:

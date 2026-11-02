@@ -1,6 +1,6 @@
 # Home Assistant Storage Monitor
 
-**Independent prototype:** `0.2.2-beta.1` (28 October 2026)
+**Independent prototype:** `0.2.3-beta.1` (1 November 2026)
 
 ## Existing installation, DO NOT repeat completed work
 
@@ -15,7 +15,7 @@
 
 - `custom_components/ha_storage_monitor`: independently installable, read-only-source HA custom integration with UI config flow, admin-only websocket API, native Lovelace card, and own hourly SQLite snapshot history.
 - `engine.py`: 1-hour UTC-identity snapshots, 1y/2y/forever retention, persistent alerts/acknowledgments, strict growth threshold, and durable InfluxDB probe attempt/success metadata.
-- `sources.py`: Recorder main + WAL + SHM apparent/allocated file bytes, bounded generic SQLite file discovery (`*.db`, `*.sqlite`, `*.sqlite3`) in `/config` and `/config/.storage` at directory depth one, additional local SQLite files aggregated separately; excludes Recorder and the monitor snapshot database, HA `/config` filesystem capacity.
+- `sources.py`: Recorder main + WAL + SHM apparent/allocated file bytes, bounded generic SQLite file discovery (`*.db`, `*.sqlite`, `*.sqlite3`) in `/config` and `/config/.storage` at directory depth one, plus the explicitly authorized read-only Home Energy Intelligence database path; excludes Recorder and the monitor snapshot database, HA `/config` filesystem capacity.
 - `supervisor.py`: 6-hour interval Supervisor `GET /host/disks/default/usage?max_depth=2` for specific `a0d7b954_influxdb` subtree. Returns `unavailable`, **not zero**, without exact authorized size. Accepts `apps_data` and `addons_data` Supervisor IDs. This may represent other components in the same InfluxDB add-on, not solely TSM shard files.
 - `writers.py`: optional bounded Recorder diagnostics, **disabled by default**. While disabled, Recorder is never opened for entity-writer queries and the dashboard reports `Recorder writer diagnostics disabled`, not zero rows. When explicitly enabled, one read-only query runs per local six-hour checkpoint with the existing timestamp index guard, 4-second progress budget, 500,000-row/5,000-entity/256-KiB payload caps, and compact counts stored in our own SQLite. The query streams indexed rows without SQL `GROUP BY` or a temporary grouping B-tree. No missed or pre-opt-in interval is queried retroactively. Dashboard ranking can select Top 20/50/100/500 from those completed monitor-owned summaries without another Recorder query.
 - `frontend/storage-monitor-card.js`: responsive seven-tab light/dark HA dashboard: Overview, Databases, Charts, Top Writers, Disk Usage, Alerts and Settings; real sampled history for 1/7/30/90 days; English/Slovenian switching; optional read-only display of the existing Recorder SQL sensor; no cloud dependencies. Top 100/500 writer rankings use fixed 50-entity pages; integration groupings are explicitly partial totals for the selected Top N.
@@ -64,6 +64,8 @@ These are instructions only, **not actions already performed**.
 ## Scope of generic local SQL file discovery
 
 - The generic **Other local SQLite databases** section is not hardcoded to any specific Home Assistant integration. It checks only `/config` and `/config/.storage` non-recursively for regular files with `.db`, `.sqlite`, or `.sqlite3` extension. Each SQLite file's main, WAL and SHM footprints are combined without reading its contents.
+- One narrow exception is separately authorized: `/config/.storage/home_energy_intelligence/home_energy_intelligence.sqlite3`. Storage Monitor stats that exact main file and its optional `-wal` and `-shm` sidecars and labels the source **Home Energy Intelligence**. It does not list or recurse through the containing directory, rejects symlinks in the fixed path and sidecars, and never includes the source in **Other local SQLite total**.
+- An installation where this optional database has never been measured shows **Not configured**, never zero, and does not raise an alert. A durable success marker in Storage Monitor's own SQLite is seeded from existing genuine history and survives snapshot retention. If a previously measured file later disappears, or an existing path is inaccessible, the observation is **Unavailable**; two consecutive failed hourly observations activate the normal durable missing-source warning and notification cooldown. Prior genuine observations and the eight-day growth evidence remain unchanged.
 - This is **not** an exhaustive scan of HA OS, protected Supervisor add-on directories, MariaDB/PostgreSQL services, remote SQL databases, or other volumes. Unknown paths and unavailable protected stores remain unavailable, never zero. Future configured additional directories and supported read-only service-specific metrics require separate access review.
 - Existing Recorder SQL sensor is preserved, and our own monitoring history DB is excluded to prevent recursive monitoring growth.
 - A discovered database file is monitored using filesystem metadata, not opened for SQL queries, and no production database is ever edited.

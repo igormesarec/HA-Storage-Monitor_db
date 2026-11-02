@@ -1,4 +1,7 @@
-from ha_storage_monitor.sources import collect_local
+from ha_storage_monitor.sources import (
+    HOME_ENERGY_INTELLIGENCE_SOURCE,
+    collect_local,
+)
 from ha_storage_monitor.supervisor import extract_addon_usage
 from ha_storage_monitor.writers import collect_writer_window
 from pathlib import Path
@@ -85,6 +88,80 @@ def test_generic_sqlite_wal_shm_are_included(tmp_path):
     assert "database:home-assistant_v2.db" not in samples
 
 
+def test_home_energy_intelligence_exact_path_includes_wal_shm_without_double_count(
+        tmp_path):
+    (tmp_path / "home-assistant_v2.db").write_bytes(b"recorder")
+    store = tmp_path / ".storage"
+    store.mkdir()
+    hei = store / "home_energy_intelligence"
+    hei.mkdir()
+    database = hei / "home_energy_intelligence.sqlite3"
+    database.write_bytes(b"abc")
+    Path(str(database) + "-wal").write_bytes(b"12345")
+    Path(str(database) + "-shm").write_bytes(b"12")
+    (hei / "unrelated.sqlite3").write_bytes(b"must not be discovered")
+    (store / "another.db").write_bytes(b"other")
+
+    rows = collect_local(str(tmp_path), 3600, 3610)
+    samples = {sample.source: sample for sample in rows}
+
+    assert sum(row.source == HOME_ENERGY_INTELLIGENCE_SOURCE for row in rows) == 1
+    assert samples[HOME_ENERGY_INTELLIGENCE_SOURCE].size == 10
+    assert samples[HOME_ENERGY_INTELLIGENCE_SOURCE].method == \
+        "sqlite_main_wal_shm_file_stat"
+    assert "database:.storage/home_energy_intelligence/unrelated.sqlite3" \
+        not in samples
+    assert samples["database_total"].size == 5
+
+
+def test_home_energy_intelligence_missing_is_not_configured_but_inaccessible_is_unavailable(
+        tmp_path, monkeypatch):
+    (tmp_path / "home-assistant_v2.db").write_bytes(b"recorder")
+    (tmp_path / ".storage").mkdir()
+    missing = {sample.source: sample for sample in collect_local(
+        str(tmp_path), 3600, 3610)}
+    assert missing[HOME_ENERGY_INTELLIGENCE_SOURCE].status == "not_configured"
+    assert missing[HOME_ENERGY_INTELLIGENCE_SOURCE].size is None
+    assert missing[HOME_ENERGY_INTELLIGENCE_SOURCE].measured_at is None
+    assert missing["database_total"].status == "ok"
+    assert missing["database_total"].size == 0
+
+    folder = tmp_path / ".storage" / "home_energy_intelligence"
+    folder.mkdir()
+    database = folder / "home_energy_intelligence.sqlite3"
+    database.write_bytes(b"data")
+    real_stat = Path.stat
+
+    def denied_stat(path, *args, **kwargs):
+        if path == database:
+            raise PermissionError("denied for test")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied_stat)
+    inaccessible = {sample.source: sample for sample in collect_local(
+        str(tmp_path), 7200, 7210)}
+    assert inaccessible[HOME_ENERGY_INTELLIGENCE_SOURCE].status == "unavailable"
+    assert inaccessible[HOME_ENERGY_INTELLIGENCE_SOURCE].size is None
+
+
+def test_home_energy_intelligence_rejects_symlinked_exact_file(tmp_path):
+    (tmp_path / "home-assistant_v2.db").write_bytes(b"recorder")
+    folder = tmp_path / ".storage" / "home_energy_intelligence"
+    folder.mkdir(parents=True)
+    outside = tmp_path / "outside.sqlite3"
+    outside.write_bytes(b"not authorized")
+    database = folder / "home_energy_intelligence.sqlite3"
+    try:
+        database.symlink_to(outside)
+    except OSError:
+        pytest.skip("Creating symlinks requires an extra privilege on this host")
+
+    samples = {sample.source: sample for sample in collect_local(
+        str(tmp_path), 3600, 3610)}
+    assert samples[HOME_ENERGY_INTELLIGENCE_SOURCE].status == "unavailable"
+    assert samples[HOME_ENERGY_INTELLIGENCE_SOURCE].size is None
+
+
 def test_excludes_own_monitor_history(tmp_path):
     (tmp_path / "home-assistant_v2.db").write_bytes(b"r")
     store = tmp_path / ".storage"
@@ -124,7 +201,10 @@ def test_generic_sqlite_total_never_reports_truncated_scan_as_exact(tmp_path):
     data={s.source:s for s in collect_local(str(tmp_path),3600,3610)}
     assert data['database_total'].status=='unavailable'
     assert data['database_total'].size is None
-    assert sum(s.source.startswith('database:') for s in data.values())<=64
+    generic = [s for s in data.values()
+               if s.source.startswith('database:') and
+               s.source != HOME_ENERGY_INTELLIGENCE_SOURCE]
+    assert len(generic)<=64
 
 
 def test_generic_sqlite_directory_symlink_not_traversed(tmp_path):
