@@ -70,6 +70,16 @@ def authorized_home_energy_intelligence(config: Path, hour: int,
         return Sample(hour, HOME_ENERGY_INTELLIGENCE_SOURCE, None,
                       "unavailable", "sqlite_main_wal_shm_file_stat", None,
                       detail=type(err).__name__)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return Sample(hour, HOME_ENERGY_INTELLIGENCE_SOURCE, None,
+                      "not_configured", "sqlite_main_wal_shm_file_stat", None,
+                      detail="Home Energy Intelligence database not configured")
+    except OSError as err:
+        return Sample(hour, HOME_ENERGY_INTELLIGENCE_SOURCE, None,
+                      "unavailable", "sqlite_main_wal_shm_file_stat", None,
+                      detail=type(err).__name__)
     return sqlite_footprint(path, HOME_ENERGY_INTELLIGENCE_SOURCE, hour, now)
 
 

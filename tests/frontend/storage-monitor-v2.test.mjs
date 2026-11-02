@@ -18,14 +18,14 @@ function summary(overrides={}) {
     ['recorder_shm',32*1024,'ok','file_stat_apparent'],
     ['influx_addon',null,'unavailable','supervisor_host_disk_usage'],
     ['database_total',9*MIB,'ok','sum_discovered_local_sqlite_files'],
-    ['database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3',null,'unavailable','sqlite_main_wal_shm_file_stat'],
+    ['database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3',null,'not_configured','sqlite_main_wal_shm_file_stat'],
     ['database:an-extremely-long-independent-database-name-for-layout.sqlite3',9*MIB,'ok','sqlite_main_wal_shm_file_stat'],
     ['disk_total',320*GIB,'ok','config_path_disk_usage'],
     ['disk_used',100*GIB,'ok','config_path_disk_usage'],
     ['disk_free',200*GIB,'ok','config_path_disk_usage'],
   ];
   return {
-    samples:rows.map(([source,size,status,method])=>({source,size,status,method,measured_at:NOW})),
+    samples:rows.map(([source,size,status,method])=>({source,size,status,method,measured_at:status==='ok'?NOW:null})),
     alerts:{disk_low:{active:0},'stale:influx_addon':{active:1,acknowledged_until:0}},
     growth:{recorder_total:{status:'learning',delta24:null,baseline_daily:null,excess_ratio:null}},
     writers:{status:'disabled',reason:'Recorder writer diagnostics disabled'},
@@ -54,9 +54,10 @@ test('all seven views render nulls, long names, learning, alerts and units',()=>
   card._tab='charts'; card.render();
   assert.deepEqual([...card.shadowRoot.querySelectorAll('[data-days]')].map(button=>button.dataset.days),['1','7','30','90']);
   card._tab='databases'; card.render();
-  assert.match(card.shadowRoot.textContent,/Unavailable/);
+  assert.match(card.shadowRoot.textContent,/Not configured/);
   assert.equal(card.shadowRoot.querySelector('[data-source="database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3"] .title').textContent,'Home Energy Intelligence');
   assert.equal(card.shadowRoot.querySelector('[data-source="database:an-extremely-long-independent-database-name-for-layout.sqlite3"] .title').getAttribute('title'),'an-extremely-long-independent-database-name-for-layout.sqlite3');
+  card._tab='settings';card.render();assert.match(card.shadowRoot.textContent,/Not configured/);
   card._tab='writers'; card.render();
   assert.match(card.shadowRoot.textContent,/Recorder writer diagnostics disabled/);
   assert.doesNotMatch(card.shadowRoot.textContent,/0 rows/);
@@ -261,7 +262,8 @@ test('Top Writers dropdown preserves limits and pages at most 50 monitor-history
   card._tab='databases';card.render();
   const hei=card.shadowRoot.querySelector('[data-source="database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3"]');
   assert.equal(hei.querySelector('.title').textContent,'Home Energy Intelligence');
-  assert.match(hei.textContent,/Unavailable/,'missing optional database must not render as zero');
+  assert.match(hei.textContent,/Not configured/,'never-installed optional database must be quiet, not zero');
+  assert.doesNotMatch(hei.textContent,/0 B/);
   card._tab='writers';card.render();
   assert.equal(card.shadowRoot.querySelector('#writer-limit').value,'500',
     'Top 500 selection survives visiting the Home Energy Intelligence database view');

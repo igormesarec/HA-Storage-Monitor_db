@@ -12,8 +12,10 @@ open the database, recurse through its directory, follow symlinks, or include
 the source in **Other local SQLite total**. Genuine hourly observations use the
 existing history, 6h/24h delta, chart, stale-warning and eight-day growth paths.
 
-If Home Energy Intelligence is not installed, its dedicated card reports
-**Unavailable**, never zero. After two consecutive unavailable hourly samples,
-the normal durable missing-measurement warning applies. That warning means only
-that this optional source cannot be measured; it is not evidence of data loss
-and is not an instruction to install the optional integration.
+If Home Energy Intelligence has never been installed or successfully measured,
+its dedicated card reports **Not configured**, never zero, and remains quiet.
+Storage Monitor records successful-source identity durably in its own SQLite and
+seeds that marker from pre-upgrade genuine snapshots. If a previously measured
+file later disappears, or an existing file is inaccessible, the card reports
+**Unavailable** and the normal warning applies after two consecutive failed
+hourly observations. Existing genuine history and growth evidence are retained.

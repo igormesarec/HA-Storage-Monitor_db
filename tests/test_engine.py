@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+import sqlite3
 from ha_storage_monitor.engine import Sample, SnapshotDB, evaluate, allow_notification, allowed_acknowledgement_sources, disk_low_evidence, HOUR, DAY, utc_hour
 
 MiB=1024**2
@@ -97,6 +98,29 @@ def test_snapshot_history_survives_restart_and_retention_only_own(tmp_path):
     assert len(db2.history('disk_free',T-DAY))==2
     db2.compact_retention(T)
     assert len(db2.history('disk_free',T-DAY))==1
+
+
+def test_successful_source_identity_survives_snapshot_retention(tmp_path):
+    source='database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3'
+    db=SnapshotDB(tmp_path/'own.sqlite3');db.initialize()
+    db.save([Sample(T-DAY,source,123,'ok','stat',T-DAY)])
+    assert db.source_was_successful(source)
+    db.compact_retention(T)
+    assert db.history(source,T-DAY)==[]
+    assert SnapshotDB(db.path).source_was_successful(source)
+
+
+def test_successful_source_identity_seeds_from_preupgrade_history(tmp_path):
+    source='database:.storage/home_energy_intelligence/home_energy_intelligence.sqlite3'
+    db=SnapshotDB(tmp_path/'legacy.sqlite3');db.initialize()
+    db.save([Sample(T,source,456,'ok','stat',T)])
+    with sqlite3.connect(db.path) as connection:
+        connection.execute("DELETE FROM metadata WHERE key=?",
+                           ('source_ever_ok:'+source,))
+    assert db.source_was_successful(source)
+    with sqlite3.connect(db.path) as connection:
+        assert connection.execute("SELECT value FROM metadata WHERE key=?",
+                                  ('source_ever_ok:'+source,)).fetchone()==('1',)
 
 
 def test_verified_sample_is_not_downgraded_by_cached_restart(tmp_path):

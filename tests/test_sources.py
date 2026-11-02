@@ -114,14 +114,15 @@ def test_home_energy_intelligence_exact_path_includes_wal_shm_without_double_cou
     assert samples["database_total"].size == 5
 
 
-def test_home_energy_intelligence_missing_and_inaccessible_are_unavailable(
+def test_home_energy_intelligence_missing_is_not_configured_but_inaccessible_is_unavailable(
         tmp_path, monkeypatch):
     (tmp_path / "home-assistant_v2.db").write_bytes(b"recorder")
     (tmp_path / ".storage").mkdir()
     missing = {sample.source: sample for sample in collect_local(
         str(tmp_path), 3600, 3610)}
-    assert missing[HOME_ENERGY_INTELLIGENCE_SOURCE].status == "unavailable"
+    assert missing[HOME_ENERGY_INTELLIGENCE_SOURCE].status == "not_configured"
     assert missing[HOME_ENERGY_INTELLIGENCE_SOURCE].size is None
+    assert missing[HOME_ENERGY_INTELLIGENCE_SOURCE].measured_at is None
     assert missing["database_total"].status == "ok"
     assert missing["database_total"].size == 0
 
