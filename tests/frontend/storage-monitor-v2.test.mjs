@@ -69,6 +69,46 @@ test('all seven views render nulls, long names, learning, alerts and units',()=>
   dom.window.close();
 });
 
+test('retired sources stay historical and require explicit administrator actions',async()=>{
+  const retired='database:si-grid-retired.sqlite3';
+  const data=summary({retired_sources:[{
+    source:retired,retired_at:NOW-7200,last_detected_at:NOW-3600,
+  }]});
+  const {dom,card}=cardWith(data),calls=[];
+  dom.window.confirm=()=>true;
+  card._hass={callWS:async message=>{calls.push(message);return {};}};
+  card.reload=async()=>{};
+
+  card._tab='databases';card.render();
+  assert.equal(card.shadowRoot.querySelector(`[data-source="${retired}"]`),null,
+    'retired source is excluded from the current database list');
+  card._tab='charts';card.render();
+  const retiredOption=[...card.shadowRoot.querySelectorAll('#source option')]
+    .find(option=>option.value===retired);
+  assert.ok(retiredOption,'retired history remains selectable');
+  assert.match(retiredOption.textContent,/Retired/);
+
+  card._tab='settings';card.render();
+  assert.match(card.shadowRoot.textContent,/Retired local SQLite sources/);
+  assert.match(card.shadowRoot.textContent,/Detected again/);
+  assert.match(card.shadowRoot.textContent,/fresh eight-day growth-learning period/);
+  const retire=card.shadowRoot.querySelector('[data-retire="database:an-extremely-long-independent-database-name-for-layout.sqlite3"]');
+  const reactivate=card.shadowRoot.querySelector(`[data-reactivate="${retired}"]`);
+  assert.ok(retire);assert.ok(reactivate);
+  retire.click();reactivate.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.deepEqual(calls.map(call=>call.type),[
+    'ha_storage_monitor/retire_source','ha_storage_monitor/reactivate_source']);
+  assert.equal(calls[0].source,'database:an-extremely-long-independent-database-name-for-layout.sqlite3');
+  assert.equal(calls[1].source,retired);
+
+  card._language='sl';card.render();
+  assert.match(card.shadowRoot.textContent,/Upokojeni lokalni viri SQLite/);
+  assert.match(card.shadowRoot.textContent,/Ponovno zaznano/);
+  assert.match(card.shadowRoot.textContent,/novo osemdnevno obdobje učenja rasti/);
+  dom.window.close();
+});
+
 test('chart reports constant and small fluctuations without hiding precision',()=>{
   const {dom,card}=cardWith();
   card._points=[0,1,2].map(index=>({hour:NOW+(index-2)*3600,size:5*GIB,status:'ok'}));

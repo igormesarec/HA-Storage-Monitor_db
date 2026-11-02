@@ -104,9 +104,16 @@ class SnapshotDB:
               CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
               );
+              CREATE TABLE IF NOT EXISTS source_lifecycle (
+                source TEXT PRIMARY KEY,
+                retired INTEGER NOT NULL DEFAULT 0,
+                retired_at INTEGER,
+                reactivated_at INTEGER,
+                last_detected_at INTEGER
+              );
             """)
-            db.execute("""INSERT INTO metadata(key,value) VALUES('schema','2')
-                ON CONFLICT(key) DO UPDATE SET value='2'""")
+            db.execute("""INSERT INTO metadata(key,value) VALUES('schema','3')
+                ON CONFLICT(key) DO UPDATE SET value='3'""")
             self._migrate_influx_probe_metadata(db)
 
     @staticmethod
@@ -157,6 +164,11 @@ class SnapshotDB:
         if not rows:
             return
         with _raw_connection(self.path) as db:
+            retired={row[0] for row in db.execute(
+                "SELECT source FROM source_lifecycle WHERE retired=1")}
+            rows=[sample for sample in rows if sample.source not in retired]
+            if not rows:
+                return
             db.executemany("""INSERT INTO snapshots
                (hour,source,size,status,method,measured_at,allocated,detail)
                VALUES(?,?,?,?,?,?,?,?)
@@ -388,6 +400,85 @@ class SnapshotDB:
                ON m.source=s.source AND m.hour=s.hour ORDER BY s.source""").fetchall()
             return [dict(r) for r in rows]
 
+    @staticmethod
+    def _validate_retirable_source(source: str):
+        if (not isinstance(source, str) or len(source) > 512 or
+                not source.startswith("database:") or "\x00" in source):
+            raise ValueError("Only observed local SQLite sources may be retired")
+
+    def retire_source(self, source: str, now: int) -> dict:
+        """Retire one observed local SQLite source in monitor metadata only."""
+        self._validate_retirable_source(source)
+        with _raw_connection(self.path) as db:
+            observed = db.execute(
+                "SELECT 1 FROM snapshots WHERE source=? LIMIT 1", (source,)
+            ).fetchone()
+            if observed is None:
+                raise ValueError("Source has no Storage Monitor history")
+            db.execute("""INSERT INTO source_lifecycle
+                (source,retired,retired_at,reactivated_at,last_detected_at)
+                VALUES(?,1,?,NULL,NULL)
+                ON CONFLICT(source) DO UPDATE SET retired=1,
+                  retired_at=CASE WHEN source_lifecycle.retired=1
+                    THEN source_lifecycle.retired_at ELSE excluded.retired_at END,
+                  reactivated_at=NULL,
+                  last_detected_at=CASE WHEN source_lifecycle.retired=1
+                    THEN source_lifecycle.last_detected_at ELSE NULL END""",
+                (source, int(now)))
+            db.execute("""UPDATE alerts SET active=0,opened_at=NULL
+                WHERE source IN (?,?)""", (source, "stale:" + source))
+            retired_at=db.execute("""SELECT retired_at FROM source_lifecycle
+                WHERE source=?""", (source,)).fetchone()[0]
+        return {"source": source, "retired": True,
+                "retired_at": int(retired_at)}
+
+    def reactivate_source(self, source: str, now: int) -> dict:
+        """Explicitly reactivate; old snapshots stay historical evidence only."""
+        self._validate_retirable_source(source)
+        with _raw_connection(self.path) as db:
+            changed = db.execute("""UPDATE source_lifecycle
+                SET retired=0,reactivated_at=?
+                WHERE source=? AND retired=1""", (int(now), source)).rowcount
+            if changed != 1:
+                raise ValueError("Source is not retired")
+        return {"source": source, "retired": False,
+                "reactivated_at": int(now)}
+
+    def retired_sources(self) -> list[dict]:
+        with _raw_connection(self.path) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""SELECT source,retired_at,last_detected_at
+                FROM source_lifecycle WHERE retired=1
+                ORDER BY retired_at DESC,source""").fetchall()
+            return [dict(row) for row in rows]
+
+    def retired_source_keys(self) -> set[str]:
+        return {row["source"] for row in self.retired_sources()}
+
+    def note_retired_detected(self, sources: Iterable[str], now: int):
+        keys = list(set(sources))
+        if not keys:
+            return
+        with _raw_connection(self.path) as db:
+            db.executemany("""UPDATE source_lifecycle SET last_detected_at=?
+                WHERE source=? AND retired=1""",
+                [(int(now), source) for source in keys])
+
+    def reactivated_at(self, source: str) -> int | None:
+        with _raw_connection(self.path) as db:
+            row = db.execute("""SELECT reactivated_at FROM source_lifecycle
+                WHERE source=? AND retired=0""", (source,)).fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+
+    def latest_source_membership_change(self) -> int | None:
+        with _raw_connection(self.path) as db:
+            row=db.execute("""SELECT MAX(changed_at) FROM (
+                SELECT retired_at AS changed_at FROM source_lifecycle
+                UNION ALL
+                SELECT reactivated_at AS changed_at FROM source_lifecycle
+            )""").fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+
     def source_was_successful(self, source: str) -> bool:
         """Return durable success knowledge, seeding it from legacy history."""
         key = "source_ever_ok:" + source
@@ -482,6 +573,15 @@ class SnapshotDB:
     def set_alert(self, source: str, *, active: bool, window: str | None,
                   now: int, notified: bool = False):
         with _raw_connection(self.path) as db:
+            lifecycle_source=(source[6:] if source.startswith("stale:")
+                              else source)
+            if active and lifecycle_source.startswith("database:"):
+                retired=db.execute("""SELECT 1 FROM source_lifecycle
+                    WHERE source=? AND retired=1""",
+                    (lifecycle_source,)).fetchone()
+                if retired is not None:
+                    active=False
+                    notified=False
             db.execute("""INSERT INTO alerts(source,active,last_window,opened_at,last_notify_at)
                 VALUES(?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET
                 active=excluded.active,

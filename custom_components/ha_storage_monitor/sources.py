@@ -156,7 +156,10 @@ def collect_local(config_dir: str, hour: int, now: int) -> list[Sample]:
                             sum(s.allocated for s in discovered)
                             if all(s.allocated is not None for s in discovered) else None))
     else:
+        detail = ("Directory listing incomplete or more than 64 candidates"
+                  if scan_incomplete else
+                  "A currently discovered database is unreadable")
         items.append(Sample(hour, "database_total", None, "unavailable",
                             "sum_discovered_local_sqlite_files", None,
-                            detail="Directory listing incomplete, >64 candidates, or a database is unreadable"))
+                            detail=detail))
     return items
