@@ -229,6 +229,41 @@ test('growth alarms expose durable 24-hour and seven-day acknowledgments',async(
   dom.window.close();
 });
 
+test('growth table renders backend coverage shrink eligibility and reasons',()=>{
+  const shrinkAt=NOW-3*24*3600;
+  const data=summary({
+    alerts:{disk_low:{active:0},recorder_total:{active:0,acknowledged_until:0},influx_addon:{active:0,acknowledged_until:0}},
+    growth:{
+      recorder_total:{status:'maintenance',reason_code:'observed_shrink',
+        delta24:12*MIB,baseline_daily:null,excess_ratio:null,
+        verified_days:7,required_days:8,verified_checkpoints:33,
+        required_checkpoints:33,missing_required_measurements:0,
+        hourly_verified_measurements:191,hourly_required_measurements:160,
+        last_shrink_at:shrinkAt,last_shrink_from:2*GIB,
+        last_shrink_to:1.5*GIB,baseline_eligible_at:NOW+5*24*3600},
+      influx_addon:{status:'learning',reason_code:'latest_cached',delta24:null,
+        baseline_daily:null,excess_ratio:null,verified_days:6,required_days:8,
+        verified_checkpoints:31,required_checkpoints:33,
+        missing_required_measurements:2,baseline_eligible_at:NOW+8*24*3600},
+    },
+  });
+  const {dom,card}=cardWith(data);card._tab='alerts';card.render();
+  const text=card.shadowRoot.textContent;
+  assert.match(text,/Last valid 24h/);
+  assert.match(text,/7\/8 UTC days/);
+  assert.match(text,/33\/33 checkpoints/);
+  assert.match(text,/Maintenance: observed shrink on/);
+  assert.match(text,/2\.00 GiB → 1\.50 GiB/);
+  assert.match(text,/Earliest if future samples succeed/);
+  assert.match(text,/InfluxDB checkpoint is cached, not a fresh measurement/);
+  card._language='sl';card.render();
+  assert.match(card.shadowRoot.textContent,/Zadnjih veljavnih 24h/);
+  assert.match(card.shadowRoot.textContent,/Vzdrževanje: zaznano zmanjšanje/);
+  assert.match(card.shadowRoot.textContent,/kontrolna točka InfluxDB je predpomnjena/);
+  assert.match(card.shadowRoot.textContent,/Najprej, če prihodnje meritve uspejo/);
+  dom.window.close();
+});
+
 test('enabled writer data and language switching remain functional',()=>{
   const enabled=summary({
     writer_diagnostics_enabled:true,

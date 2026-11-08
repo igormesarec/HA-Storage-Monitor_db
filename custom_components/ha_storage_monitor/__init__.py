@@ -23,6 +23,7 @@ from .writers import (WRITER_PAGE_SIZE, WRITER_RANKING_LIMITS,
 
 _LOGGER = logging.getLogger(__name__)
 TZ = ZoneInfo("Europe/Ljubljana")
+SAMPLE_SECOND = 10
 
 
 def next_influx_probe_opportunity(last_attempt_at: int | None, now: int) -> int | None:
@@ -32,13 +33,27 @@ def next_influx_probe_opportunity(last_attempt_at: int | None, now: int) -> int 
     for day_offset in range(4):
         day = local.date() + timedelta(days=day_offset)
         for checkpoint_hour in ALARM_HOURS:
-            candidate = datetime(day.year,day.month,day.day,checkpoint_hour,tzinfo=TZ)
+            candidate = datetime(day.year,day.month,day.day,checkpoint_hour,
+                                 second=SAMPLE_SECOND,tzinfo=TZ)
             timestamp = int(candidate.timestamp())
             if last_attempt_at is None:
                 if timestamp >= int(now):
                     return timestamp
             elif timestamp > int(last_attempt_at) and timestamp-int(last_attempt_at) >= 6*HOUR:
                 return timestamp
+    return None
+
+
+def next_growth_checkpoint(not_before: int) -> int | None:
+    """Return the first scheduled local evaluation at/after a lower bound."""
+    local=datetime.fromtimestamp(int(not_before),TZ)
+    for day_offset in range(12):
+        day=local.date()+timedelta(days=day_offset)
+        for checkpoint_hour in ALARM_HOURS:
+            candidate=datetime(day.year,day.month,day.day,checkpoint_hour,
+                               second=SAMPLE_SECOND,tzinfo=TZ)
+            if int(candidate.timestamp())>=int(not_before):
+                return int(candidate.timestamp())
     return None
 
 
@@ -133,7 +148,8 @@ class StorageMonitor:
         self.writer_diagnostics_enabled_at=await self.hass.async_add_executor_job(
             self.db.configure_writer_diagnostics,
             self.writer_diagnostics_enabled,int(time.time()))
-        self.unsub = async_track_time_change(self.hass,self._hourly,minute=0,second=10)
+        self.unsub = async_track_time_change(
+            self.hass,self._hourly,minute=0,second=SAMPLE_SECOND)
         # Cold start updates current measurements without firing historical growth alerts.
         self.entry.async_create_background_task(
             self.hass,self.sample(False,startup=True),"Storage Monitor startup")
@@ -375,13 +391,20 @@ class StorageMonitor:
             reactivated=await self.hass.async_add_executor_job(
                 self.db.reactivated_at,key)
             if reactivated is not None and hour < reactivated + 8*DAY:
-                evidence={"points":[],"observed_shrink":False,
-                          "hourly_coverage_ok":False}
+                evidence=dict(evidence)
+                evidence.update({
+                    "forced_reason_code":"reactivation_learning",
+                    "forced_reason":(
+                        "Learning after explicit source reactivation; a fresh "
+                        "eight-day baseline is required"),
+                    "baseline_eligible_not_before":reactivated+8*DAY,
+                })
             ev=evaluate(key,evidence["points"],hour,
                 min_excess_bytes=int(self.options.get("min_excess_mib",0))*1024*1024,
                 cadence_hours=6,
                 observed_shrink=evidence["observed_shrink"],
-                hourly_coverage_ok=evidence["hourly_coverage_ok"])
+                hourly_coverage_ok=evidence["hourly_coverage_ok"],
+                diagnostics=evidence)
             previous=await self.hass.async_add_executor_job(self.db.get_alert,key)
             if ev.status=="alarm":
                 permitted=allow_notification(previous,window,hour)
@@ -626,11 +649,28 @@ class StorageMonitor:
                     self.db.reactivated_at,key)
                 if (reactivated is not None and
                         checkpoint_end < reactivated + 8*DAY):
-                    evidence={"points":[],"observed_shrink":False,
-                              "hourly_coverage_ok":False}
-                growth[key]=evaluate(key,evidence["points"],checkpoint_end,cadence_hours=6,
+                    evidence=dict(evidence)
+                    evidence.update({
+                        "forced_reason_code":"reactivation_learning",
+                        "forced_reason":(
+                            "Learning after explicit source reactivation; a "
+                            "fresh eight-day baseline is required"),
+                        "baseline_eligible_not_before":reactivated+8*DAY,
+                    })
+                evaluation=evaluate(key,evidence["points"],checkpoint_end,
+                    min_excess_bytes=int(self.options.get("min_excess_mib",0))*1024*1024,
+                    cadence_hours=6,
                     observed_shrink=evidence["observed_shrink"],
-                    hourly_coverage_ok=evidence["hourly_coverage_ok"]).as_json()
+                    hourly_coverage_ok=evidence["hourly_coverage_ok"],
+                    diagnostics=evidence).as_json()
+                lower_bound=evaluation.get("baseline_eligible_not_before")
+                if (lower_bound is not None and
+                        evaluation["status"] in ("learning","maintenance")):
+                    evaluation["baseline_eligible_at"]=next_growth_checkpoint(
+                        int(lower_bound))
+                else:
+                    evaluation["baseline_eligible_at"]=None
+                growth[key]=evaluation
         alerts["disk_low"]=await self.hass.async_add_executor_job(self.db.get_alert,"disk_low")
         for key in keys:
             alerts["stale:"+key]=await self.hass.async_add_executor_job(self.db.get_alert,"stale:"+key)

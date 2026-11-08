@@ -50,6 +50,13 @@ def test_maintenance_even_with_recent_growth():
 def test_zero_baseline_learning():
     assert evaluate('recorder_total',history(growth=211,baseline=0),T).status=='learning'
 
+
+def test_negative_baseline_is_observed_maintenance_not_a_denominator():
+    result=evaluate('recorder_total',history(growth=211,baseline=-10),T)
+    assert result.status=='maintenance'
+    assert result.reason_code=='observed_shrink'
+    assert result.baseline_daily is None
+
 def test_extra_floor_default_disabled_and_optional_floor():
     assert evaluate('x',history(),T).status=='alarm'
     assert evaluate('x',history(),T,min_excess_bytes=20*MiB).status=='normal'
