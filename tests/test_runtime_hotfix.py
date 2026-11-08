@@ -283,6 +283,8 @@ def test_retired_source_is_quarantined_aggregate_survives_and_reactivation_learn
     summary=_run(monitor.summary())
     assert retired not in {row['source'] for row in summary['samples']}
     assert summary['retired_sources'][0]['source']==retired
+    assert retired not in summary['growth']
+    assert active in summary['growth']
 
     current[0]+=runtime.HOUR
     _run(monitor.reactivate_source(retired))
@@ -293,6 +295,8 @@ def test_retired_source_is_quarantined_aggregate_survives_and_reactivation_learn
     summary=_run(monitor.summary())
     assert retired in {row['source'] for row in summary['samples']}
     assert summary['growth'][retired]['status']=='learning'
+    assert summary['growth'][retired]['reason_code']=='reactivation_learning'
+    assert summary['growth'][retired]['baseline_eligible_at'] is not None
 
 
 def test_reactivation_requires_two_new_missing_observations(tmp_path,monkeypatch):
@@ -883,7 +887,7 @@ def test_influx_failed_opportunities_alert_once_survive_restart_and_recover(
     assert health["last_attempt_status"]=="failure"
     assert health["consecutive_failures"]==3
     assert health["next_eligible_at"]==int(datetime(
-        2026,10,29,0,0,tzinfo=runtime.TZ).timestamp())
+        2026,10,29,0,0,10,tzinfo=runtime.TZ).timestamp())
 
     # A later genuine success resets health, clears the durable alert and
     # dismisses only Storage Monitor's own persistent notification.
@@ -987,15 +991,21 @@ def test_influx_overdue_policy_and_dst_checkpoint_selection(monkeypatch):
     runtime=_load_runtime(monkeypatch)
     success={"size":7*GIB,"measured_at":0,
              "method":"supervisor_addons_data_total","detail":"verified"}
+    ordinary=int(datetime(2026,11,8,6,0,10,tzinfo=runtime.TZ).timestamp())
+    assert runtime.next_influx_probe_opportunity(ordinary,ordinary)==int(
+        datetime(2026,11,8,12,0,10,tzinfo=runtime.TZ).timestamp())
+    offset=int(datetime(2026,11,8,18,34,tzinfo=runtime.TZ).timestamp())
+    assert runtime.next_influx_probe_opportunity(offset,offset)==int(
+        datetime(2026,11,9,6,0,10,tzinfo=runtime.TZ).timestamp())
     spring_attempt=int(datetime(2026,3,29,0,0,tzinfo=runtime.TZ).timestamp())
     spring_next=runtime.next_influx_probe_opportunity(
         spring_attempt,spring_attempt)
-    assert spring_next==int(datetime(2026,3,29,12,0,
+    assert spring_next==int(datetime(2026,3,29,12,0,10,
                                      tzinfo=runtime.TZ).timestamp())
     autumn_attempt=int(datetime(2026,10,25,0,0,tzinfo=runtime.TZ).timestamp())
     autumn_next=runtime.next_influx_probe_opportunity(
         autumn_attempt,autumn_attempt)
-    assert autumn_next==int(datetime(2026,10,25,6,0,
+    assert autumn_next==int(datetime(2026,10,25,6,0,10,
                                      tzinfo=runtime.TZ).timestamp())
     # An interrupted outcome does not alter elapsed-time checkpoint selection
     # on either DST transition.
@@ -1011,7 +1021,7 @@ def test_influx_overdue_policy_and_dst_checkpoint_selection(monkeypatch):
     assert spring_health["status"]=="probe_interrupted"
     assert spring_health["should_alert"] is False
     assert spring_health["next_eligible_at"]==int(datetime(
-        2026,3,29,12,0,tzinfo=runtime.TZ).timestamp())
+        2026,3,29,12,0,10,tzinfo=runtime.TZ).timestamp())
     state={"last_attempt_at":autumn_attempt,
            "last_success":{**success,"measured_at":autumn_attempt},
            "last_attempt_outcome":{"attempted_at":autumn_attempt,
@@ -1025,3 +1035,34 @@ def test_influx_overdue_policy_and_dst_checkpoint_selection(monkeypatch):
         state,{"status":"stale"},autumn_next+runtime.HOUR)
     assert overdue["should_alert"] is True
     assert overdue["status"]=="prolonged_unavailable"
+
+
+def test_influx_strict_cooldown_allows_normal_checkpoints_and_handles_dst(
+        tmp_path,monkeypatch):
+    runtime=_load_runtime(monkeypatch)
+
+    def successful(db,when):
+        assert db.reserve_influx_probe(when)
+        db.save_influx_result(when,runtime.Sample(
+            runtime.utc_hour(when),'influx_addon',7*GIB,'ok',
+            'supervisor_addons_data_total',when))
+
+    ordinary=runtime.SnapshotDB(tmp_path/'ordinary.sqlite3');ordinary.initialize()
+    for hour in (0,6,12,18):
+        successful(ordinary,int(datetime(2026,11,8,hour,0,10,
+                                         tzinfo=runtime.TZ).timestamp()))
+
+    spring=runtime.SnapshotDB(tmp_path/'spring.sqlite3');spring.initialize()
+    midnight=int(datetime(2026,3,29,0,0,10,tzinfo=runtime.TZ).timestamp())
+    successful(spring,midnight)
+    six=int(datetime(2026,3,29,6,0,10,tzinfo=runtime.TZ).timestamp())
+    assert not spring.reserve_influx_probe(six)
+    successful(spring,int(datetime(2026,3,29,12,0,10,
+                                   tzinfo=runtime.TZ).timestamp()))
+    successful(spring,int(datetime(2026,3,29,18,0,10,
+                                   tzinfo=runtime.TZ).timestamp()))
+
+    autumn=runtime.SnapshotDB(tmp_path/'autumn.sqlite3');autumn.initialize()
+    for hour in (0,6,12,18):
+        successful(autumn,int(datetime(2026,10,25,hour,0,10,
+                                       tzinfo=runtime.TZ).timestamp()))

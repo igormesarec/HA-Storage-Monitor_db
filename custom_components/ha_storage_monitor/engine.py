@@ -35,6 +35,19 @@ class Evaluation:
     baseline_daily: float | None = None
     excess_ratio: float | None = None
     evidence: str = ""
+    reason_code: str = ""
+    verified_days: int = 0
+    required_days: int = 8
+    verified_checkpoints: int = 0
+    required_checkpoints: int = 33
+    missing_required_measurements: int = 33
+    hourly_verified_measurements: int | None = None
+    hourly_required_measurements: int | None = None
+    last_shrink_at: int | None = None
+    last_shrink_from: int | None = None
+    last_shrink_to: int | None = None
+    baseline_eligible_not_before: int | None = None
+    latest_checkpoint_status: str | None = None
 
     def as_json(self):
         return asdict(self)
@@ -506,47 +519,90 @@ class SnapshotDB:
             return [dict(r) for r in reversed(rows)]
 
     def growth_evidence(self, source: str, now: int, *, hourly_source: bool) -> dict:
-        """Return just 33 verified/failed 6h checkpoint rows from OUR SQLite.
-
-        A separate bounded SQL check over the same small hourly history detects
-        observed shrinks hidden between checkpoints. For hourly sources we
-        additionally require >=20/24 genuine measurements in each UTC day.
-        No Recorder query is performed here.
-        """
+        """Return bounded growth evidence from OUR small SQLite history only."""
         now = utc_hour(now)
         start = now - 8 * DAY
         with _raw_connection(self.path) as db:
             db.row_factory = sqlite3.Row
-            points = [dict(r) for r in db.execute("""
-                SELECT hour,size,status,measured_at FROM snapshots
+            # At most 193 rows: eight elapsed days plus the current boundary.
+            rows=[dict(row) for row in db.execute("""
+                SELECT hour,size,status,measured_at,detail FROM snapshots
                 WHERE source=? AND hour>=? AND hour<=?
-                  AND (hour - ?) % ? = 0
-                ORDER BY hour
-                LIMIT 33
-            """, (source, start, now, now, 6 * HOUR))]
-            # Window function scans at most 193 hourly records from the
-            # monitor's tiny own history, returning only a boolean.
-            shrink = db.execute("""
-                SELECT 1 FROM (
-                  SELECT size, LAG(size) OVER (ORDER BY hour) AS previous_size
-                  FROM snapshots
-                  WHERE source=? AND hour>=? AND hour<=?
-                    AND status='ok' AND size IS NOT NULL
-                    AND measured_at IS NOT NULL AND ABS(hour-measured_at)<=1500
-                ) WHERE previous_size > size LIMIT 1
-            """, (source, start, now)).fetchone() is not None
-            coverage_ok = True
+                ORDER BY hour LIMIT 193
+            """, (source,start,now))]
+        genuine=[row for row in rows if row["status"]=="ok" and
+                 row["size"] is not None and row["measured_at"] is not None and
+                 abs(int(row["hour"])-int(row["measured_at"]))<=25*60]
+        genuine_by_hour={int(row["hour"]):row for row in genuine}
+        points=[row for row in rows if (int(row["hour"])-now)%(6*HOUR)==0]
+        required_hours=list(range(start,now+1,6*HOUR))
+        missing_hours=[hour for hour in required_hours
+                       if hour not in genuine_by_hour]
+        checkpoint_rows={int(row["hour"]):row for row in points}
+        latest=checkpoint_rows.get(now)
+        latest_status=("missing" if latest is None else
+                       "off_checkpoint" if latest["status"]=="ok" and
+                       now not in genuine_by_hour else str(latest["status"]))
+
+        last_shrink=None
+        for previous,current in zip(genuine,genuine[1:]):
+            if int(current["size"]) < int(previous["size"]):
+                last_shrink={
+                    "previous_hour":int(previous["hour"]),
+                    "hour":int(current["hour"]),
+                    "from_size":int(previous["size"]),
+                    "to_size":int(current["size"]),
+                }
+
+        day_coverage=[]
+        hourly_verified_total=0
+        missing_hourly=[]
+        for index in range(8):
+            left=start+index*DAY
+            right=left+DAY
+            expected=(list(range(left,right,HOUR)) if hourly_source else
+                      list(range(left,right,6*HOUR)))
+            verified=sum(1 for hour in expected if hour in genuine_by_hour)
+            required=20 if hourly_source else 4
             if hourly_source:
-                counts = dict(db.execute("""
-                    SELECT (hour - ?) / ? AS bucket, COUNT(*)
-                    FROM snapshots WHERE source=? AND hour>=? AND hour<?
-                      AND status='ok' AND size IS NOT NULL
-                      AND measured_at IS NOT NULL AND ABS(hour-measured_at)<=1500
-                    GROUP BY bucket
-                """, (start, DAY, source, start, now)).fetchall())
-                coverage_ok = all(counts.get(i, 0) >= 20 for i in range(8))
-            return {"points": points, "observed_shrink": shrink,
-                    "hourly_coverage_ok": coverage_ok}
+                hourly_verified_total+=verified
+                missing_hourly.extend(hour for hour in expected
+                                      if hour not in genuine_by_hour)
+            checkpoints=list(range(left,right,6*HOUR))
+            complete=(verified>=required and
+                      all(hour in genuine_by_hour for hour in checkpoints) and
+                      right in genuine_by_hour)
+            day_coverage.append({"start":left,"end":right,
+                                 "verified":verified,"required":required,
+                                 "complete":complete})
+        coverage_ok=all(day["verified"]>=day["required"]
+                        for day in day_coverage)
+        candidates=[]
+        if genuine:
+            candidates.append(int(genuine[0]["hour"])+8*DAY)
+        if last_shrink:
+            candidates.append(int(last_shrink["hour"])+8*DAY+1)
+        if missing_hours:
+            candidates.append(max(missing_hours)+8*DAY+1)
+        if missing_hourly:
+            candidates.append(max(missing_hourly)+8*DAY+1)
+        return {
+            "points":points,
+            "observed_shrink":last_shrink is not None,
+            "last_shrink":last_shrink,
+            "hourly_coverage_ok":coverage_ok,
+            "day_coverage":day_coverage,
+            "verified_days":sum(1 for day in day_coverage if day["complete"]),
+            "verified_checkpoints":len(required_hours)-len(missing_hours),
+            "required_checkpoints":len(required_hours),
+            "missing_required_measurements":len(missing_hours),
+            "missing_checkpoint_hours":missing_hours,
+            "hourly_verified_measurements":(
+                hourly_verified_total if hourly_source else None),
+            "hourly_required_measurements":160 if hourly_source else None,
+            "latest_checkpoint_status":latest_status,
+            "baseline_eligible_not_before":max(candidates) if candidates else None,
+        }
 
     def last_two(self, source: str):
         with _raw_connection(self.path) as db:
@@ -674,7 +730,8 @@ def disk_low_evidence(free_bytes: int | None, recorder_bytes: int | None,
 
 def evaluate(source: str, samples: list[dict], now: int, *, min_excess_bytes: int = 0,
              cadence_hours: int = 1, observed_shrink: bool = False,
-             hourly_coverage_ok: bool = True) -> Evaluation:
+             hourly_coverage_ok: bool = True,
+             diagnostics: dict | None = None) -> Evaluation:
     """Evaluate only complete measured UTC windows, never cached/interpolated values.
 
     Exactly 8 elapsed days of coverage is required. Each previous day needs
@@ -685,45 +742,137 @@ def evaluate(source: str, samples: list[dict], now: int, *, min_excess_bytes: in
     be inferred from hourly snapshots.
     """
     now = utc_hour(now)
-    if observed_shrink:
-        return Evaluation(source,"maintenance",evidence="Observed shrink in hourly saved measurements between checkpoints")
-    if not hourly_coverage_ok:
-        return Evaluation(source,"learning",evidence="Insufficient verified hourly coverage (need >=20/24 per day)")
+    diagnostics=diagnostics or {}
     measured = {int(x["hour"]): int(x["size"]) for x in samples
                 if x.get("size") is not None and x.get("status")=="ok"
                 and x.get("measured_at") is not None
                 and abs(int(x["hour"])-int(x["measured_at"])) <= 25*60}
-    # Check every pair of consecutive verified observations, not only the
-    # eight midnight-to-midnight net deltas. A purge/repack may shrink the
-    # file at 10:00 and regrow beyond its old size by 24:00.
-    # Even with gaps, an observed negative change is real evidence.
+    step = max(1,cadence_hours)*HOUR
+    required_hours=list(range(now-8*DAY,now+1,step))
+    missing=[hour for hour in required_hours if hour not in measured]
+    required_checkpoints=int(diagnostics.get("required_checkpoints",
+                                              len(required_hours)))
+    verified_checkpoints=int(diagnostics.get(
+        "verified_checkpoints",required_checkpoints-len(missing)))
+    missing_required=int(diagnostics.get(
+        "missing_required_measurements",len(missing)))
+    required_per_day=20 if cadence_hours==1 else max(1,math.ceil(.8*DAY/step))
+    derived_days=0
+    for index in range(8):
+        left=now-8*DAY+index*DAY
+        count=sum(1 for hour in range(left,left+DAY,step) if hour in measured)
+        if (count>=required_per_day and left in measured and
+                left+DAY in measured):
+            derived_days+=1
+    verified_days=int(diagnostics.get("verified_days",derived_days))
+    common={
+        "verified_days":verified_days,
+        "verified_checkpoints":verified_checkpoints,
+        "required_checkpoints":required_checkpoints,
+        "missing_required_measurements":missing_required,
+        "hourly_verified_measurements":diagnostics.get(
+            "hourly_verified_measurements"),
+        "hourly_required_measurements":diagnostics.get(
+            "hourly_required_measurements"),
+        "baseline_eligible_not_before":diagnostics.get(
+            "baseline_eligible_not_before"),
+        "latest_checkpoint_status":diagnostics.get(
+            "latest_checkpoint_status"),
+    }
+    bounds = [now - x*DAY for x in range(9)]
+    delta24=(measured[bounds[0]]-measured[bounds[1]]
+             if bounds[0] in measured and bounds[1] in measured else None)
+
+    # Check every pair of consecutive genuine observations. Missing rows are
+    # never sizes and therefore cannot themselves be interpreted as shrinkage.
     observed = sorted((hour, size) for hour, size in measured.items()
                       if now - 8*DAY <= hour <= now)
-    for (_, earlier), (_, later) in zip(observed, observed[1:]):
+    derived_shrink=None
+    for (previous_hour,earlier),(hour,later) in zip(observed,observed[1:]):
         if later < earlier:
-            return Evaluation(source, "maintenance",
-                evidence="Observed size decrease within eight-day interval; waiting for a clean baseline")
-    bounds = [now - x*DAY for x in range(9)]
+            derived_shrink={"previous_hour":previous_hour,"hour":hour,
+                            "from_size":earlier,"to_size":later}
+    shrink=diagnostics.get("last_shrink") or derived_shrink
+    if shrink:
+        common.update({"last_shrink_at":int(shrink["hour"]),
+                       "last_shrink_from":int(shrink["from_size"]),
+                       "last_shrink_to":int(shrink["to_size"])})
+    forced_reason=diagnostics.get("forced_reason")
+    if forced_reason:
+        return Evaluation(source,"learning",delta24=delta24,
+                          evidence=str(forced_reason),
+                          reason_code=str(diagnostics.get(
+                              "forced_reason_code") or "learning"),**common)
+    if observed_shrink or shrink:
+        return Evaluation(source,"maintenance",delta24=delta24,
+                          evidence=("Observed size decrease within the rolling "
+                                    "eight-day interval; waiting for a clean baseline"),
+                          reason_code="observed_shrink",**common)
+
+    latest_status=common["latest_checkpoint_status"]
+    # Runtime growth evaluation uses six-hour checkpoint evidence. Direct
+    # hourly evaluation deliberately permits up to four missing observations
+    # per UTC day as long as all daily boundaries remain genuine.
+    if missing_required and cadence_hours>1:
+        if latest_status=="cached":
+            reason="Latest required checkpoint is cached, not a fresh measurement"
+            code="latest_cached"
+        elif latest_status=="off_checkpoint":
+            reason=("Latest measurement occurred more than 25 minutes from "
+                    "the required UTC checkpoint")
+            code="latest_off_checkpoint"
+        elif latest_status in ("unavailable","stale","missing"):
+            label="missing" if latest_status=="missing" else latest_status
+            reason=f"Latest required checkpoint is {label}, not a fresh measurement"
+            code="latest_"+str(latest_status)
+        else:
+            reason=(f"Missing {missing_required} required "
+                    f"{cadence_hours}-hour checkpoint"
+                    f"{'s' if missing_required!=1 else ''}")
+            code="missing_checkpoints"
+        return Evaluation(source,"learning",delta24=delta24,evidence=reason,
+                          reason_code=code,**common)
+    if not hourly_coverage_ok:
+        verified=common["hourly_verified_measurements"]
+        required=common["hourly_required_measurements"]
+        detail=(f" ({verified}/{required} hourly measurements)"
+                if verified is not None and required is not None else "")
+        return Evaluation(source,"learning",delta24=delta24,
+                          evidence=("Insufficient verified hourly coverage; need "
+                                    ">=20/24 per UTC day"+detail),
+                          reason_code="hourly_coverage",**common)
     if any(t not in measured for t in bounds):
-        return Evaluation(source,"learning",evidence="Need fresh size samples at all nine 24h UTC boundaries (8 days)")
-    step = max(1,cadence_hours)*HOUR
-    required = 20 if cadence_hours == 1 else max(1, math.ceil(0.8*DAY/step))
+        return Evaluation(source,"learning",delta24=delta24,
+                          evidence="Fresh samples are required at all nine 24h UTC boundaries",
+                          reason_code="missing_boundaries",**common)
     for i in range(8):
         left, right = bounds[i+1], bounds[i]
         count = sum(1 for t in range(left, right, step) if t in measured)
-        if count < required:
-            return Evaluation(source,"learning",evidence=f"Incomplete measured coverage in day window {i+1}: {count}/{DAY//step}")
+        if count < required_per_day:
+            return Evaluation(source,"learning",delta24=delta24,
+                              evidence=(f"Incomplete measured coverage in UTC day "
+                                        f"window {i+1}: {count}/{DAY//step}"),
+                              reason_code="day_coverage",**common)
     daily_deltas = [measured[bounds[i]]-measured[bounds[i+1]] for i in range(8)]
     if any(v<0 for v in daily_deltas):
-        return Evaluation(source,"maintenance",evidence="Database file shrank in at least one daily window; waiting for clean baseline")
-    delta24 = daily_deltas[0]
+        return Evaluation(source,"maintenance",delta24=daily_deltas[0],
+                          evidence="Database file shrank in a daily window; waiting for a clean baseline",
+                          reason_code="observed_shrink",**common)
+    delta24=daily_deltas[0]
     baseline = sum(daily_deltas[1:])/7.0
     if baseline<=0:
-        return Evaluation(source,"learning",delta24=delta24,evidence="Previous seven-day baseline is zero or negative")
+        zero_common={**common,"baseline_eligible_not_before":None}
+        return Evaluation(source,"learning",delta24=delta24,
+                          evidence="Previous seven-day baseline is zero or negative",
+                          reason_code="zero_or_negative_baseline",**zero_common)
     excess_ratio = delta24/baseline-1
     if delta24>baseline*1.05 and delta24-baseline > min_excess_bytes:
-        return Evaluation(source,"alarm",delta24,baseline,excess_ratio,"Strictly more than 5% above previous 7-day average daily growth")
-    return Evaluation(source,"normal",delta24,baseline,excess_ratio)
+        return Evaluation(source,"alarm",delta24,baseline,excess_ratio,
+                          "Strictly more than 5% above previous 7-day average daily growth",
+                          "alarm",**common)
+    return Evaluation(source,"normal",delta24,baseline,excess_ratio,
+                      "Valid eight-day comparison is within the configured threshold",
+                      "normal",**common)
 
 
 def allow_notification(alert: dict, window: str, now: int) -> bool:
